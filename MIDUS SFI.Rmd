@@ -1,0 +1,2862 @@
+---
+title: "MIDUS SFI Analysis"
+author: "Charlie Collinge"
+date: "2026-01-09"
+output: html_document
+---
+
+# Set up
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+
+#library packages#
+library(readxl)
+library(haven)
+library(tidyverse)
+library(openxlsx)
+library(corrplot)
+library(RColorBrewer)
+library(pROC)
+library(PRROC)
+library(boot)
+library(iml)
+library(cocor)
+library(nptest)
+library(rms)
+
+
+#specify an out directory for results & visualization#
+outdir <- "/example/directory/"
+
+#####################
+#load initial data#
+#####################
+#import individual files#
+maind <- read_excel("/sourcedirectory/M2 MR1 SFI data.xlsx", col_names = TRUE, guess_max = 12000)
+mainv <- read_excel("/sourcedirectory/M2 MR1 SFI criterion.xlsx", col_names = TRUE, guess_max = 12000)
+m2mke <- read_sav("/sourcedirectory/22840-0001-Data-REST.sav")
+mR1mke <- read_sav("/sourcedirectory/36722-0001-Data-REST.sav")
+
+#"maind" contains a set variables from MIDUS necessary to compute the SFI-10#
+#(& by extension the SFI-8, and models based on age & sex)#
+#"maindv" contains criterion variables used in this analysis#
+#Data from the Milwaukee (mke) samples is offered by MIDUS as a#
+#restricted data product that qualified researchers can apply for.#
+#Data from the mke samples in M2 ("m2mke") and MR1 ("mR1mke")#
+#are combined here with main sample data to create a final analytic dataset#
+
+#Specific variables used can be ascertained from the code below.#
+#However, a comprehensive list of variable names used in this analysis#
+#will be provided upon request to: collinge@umn.edu#
+  
+head(maind)
+head(mainv)
+head(m2mke)
+head(mR1mke)
+
+#####################
+#tidy#
+#####################
+dv <- merge(maind, mainv, by = c("MIDUSID", "SAMPLMAJ", "M2ID", "MRID"), all = TRUE)
+head(dv)
+
+dv$M2ID <- as.numeric(dv$M2ID)
+dv$MRID <- as.numeric(dv$MRID)
+
+#reconstructing MR1 iadl summary var (RA1SMADL)#
+R1iadlqs <- c("RA1SA24A", "RA1SA24C", "RA1SA24E", "RA1SA24F", 
+              "RA1SA24G", "RA1SA24I", "RA1SA24J")
+
+for (nomiss in R1iadlqs) {
+  x <- as.numeric(dv[[nomiss]])
+  valid <- x %in% 1:4
+  x[valid] <- 5 - x[valid]
+  dv[[nomiss]] <- x
+}
+
+dv$RA1SMADL <- apply(dv[R1iadlqs], 1,
+                     function(row) {
+                       if (all(row == -1, na.rm = TRUE)) {return(-1)
+                         }
+                       valid <- row %in% 1:4
+                       if (any(valid)) {
+                         return(mean(row[valid]))
+                       } else {return(8)
+                       }
+                       }
+                     )
+  
+summary(dv$RA1SMADL[!(dv$RA1SMADL %in% c(-1, 8))])
+table(!is.na(dv$RA1SMADL[!(dv$RA1SMADL %in% c(-1, 8))]))
+
+dv$RA1SMADL[dv$RA1SMADL == -1] <- NA
+dv$RA1SMADL[dv$RA1SMADL == 8] <- NA
+
+colnames(mR1mke)[colnames(mR1mke) == "RAACIADL"] <- "RAACMADL"
+
+#integrate MKE data#
+m2mkevars <- setdiff(intersect(names(dv), names(m2mke)), c("M2ID", "SAMPLMAJ"))
+mR1mkevars <- setdiff(intersect(names(dv), names(mR1mke)), c("MRID", "SAMPLMAJ"))
+
+dv <- dv %>%
+  left_join(m2mke, by = c("M2ID", "SAMPLMAJ"), suffix = c("", ".m2mke")) %>%
+  mutate(across(all_of(m2mkevars), ~ get(paste0(cur_column(), ".m2mke")))) %>%
+  select(-ends_with(".m2mke"))
+
+dv <- dv %>%
+  left_join(mR1mke, by = c("MRID", "SAMPLMAJ"), suffix = c("", ".mR1mke")) %>%
+  mutate(across(all_of(mR1mkevars), ~ get(paste0(cur_column(), ".mR1mke")))) %>%
+  select(-ends_with(".mR1mke"))
+
+#combining core and MKE vars#
+pairsdv <- list(
+  interview_M_M2 = c("B1PIDATE_MO", "BACIDATE_MO"),
+  interview_Y_M2 = c("B1PIDATE_YR", "BACIDATE_YR"),
+  sex_M2 = c("B1PRSEX", "BACRSEX"),
+  age_M2 = c("B1PRAGE_2019", "BACRAGE_2018"), 
+  neighborhood_clean_M2 = c("B1SI6K", "BACIS6K"),
+  financial_control_M2 = c("B1SG4", "BACGS4"), 
+  family_contact_M2 = c("B1SJ1", "BACJS1"),
+  friends_contact_M2 = c("B1SJ3", "BACJS3"),
+  work_M2 = c("B1PBWORK", "BACB3WK"), 
+  volunteerhn_M2 = c("B1SH7A", "BACHS7A"),
+  volunteersoy_M2 = c("B1SH7B", "BACHS7B"),
+  volunteerpoc_M2 = c("B1SH7C", "BACHS7C"),
+  volunteerother_M2 = c("B1SH7D", "BACHS7D"),
+  lonely_M2 = c("B1SA24G", "BACAS24G"),
+  close_M2 = c("B1SA26G", "BACAS26G"),
+  belong_M2 = c("B1SA26H", "BACAS26H"),
+  courtesy_M2 = c("B1SP2A", "BACPS2A"),
+  respect_M2 = c("B1SP2B", "BACPS2B"),
+  interview_M_R1 = c("RA1PIDATE_MO", "RAACIDATE_MO"),
+  interview_Y_R1 = c("RA1PIDATE_YR", "RAACIDATE_YR"),
+  sex_R1 = c("RA1PRSEX", "RAACRSEX"),
+  age_R1 = c("RA1PRAGE", "RAACRAGE"), 
+  neighborhood_clean_R1 = c("RA1SJ6K", "RAACIS6K"),
+  financial_control_R1 = c("RA1SH5", "RAACGS4"), 
+  family_contact_R1 = c("RA1SK1", "RAASF1"),
+  friends_contact_R1 = c("RA1SK5", "RAASF5"),
+  work_R1 = c("RA1PB3WK", "RAACB3WK"), 
+  volunteerhn_R1 = c("RA1SI7A", "RAACHS7A"),
+  volunteersoy_R1 = c("RA1SI7B", "RAACHS7B"),
+  volunteerpoc_R1 = c("RA1SI7C", "RAACHS7C"),
+  volunteerother_R1 = c("RA1SI7D", "RAACHS7D"),
+  lonely_R1 = c("RA1SA20G", "RAACAS24G"),
+  close_R1 = c("RA1SA22G", "RAACAS26G"),
+  belong_R1 = c("RA1SA22H", "RAACAS26H"),
+  courtesy_R1 = c("RA1SQ2A", "RAACPS2A"),
+  respect_R1 = c("RA1SQ2B", "RAACPS2B"), 
+  health_M2 = c("B1PA1", "BACA1"),
+  mehealth_M2 = c("B1PA2", "BACA2"),
+  pwb_autonomy_M2 = c("B1SPWBA2", "BASPWBA2"),
+  pwb_environment_M2 = c("B1SPWBE2", "BASPWBE2"), 
+  pwb_growth_M2 = c("B1SPWBG2", "BASPWBG2"), 
+  pwb_relations_M2 = c("B1SPWBR2", "BASPWBR2"),
+  pwb_purpose_M2 = c("B1SPWBU2", "BASPWBU2"), 
+  pwb_acceptance_M2 = c("B1SPWBS2", "BASPWBS2"), 
+  swb_meaningful_M2 = c("B1SSWBMS", "BASSWBMS"), 
+  swb_integration_M2 = c("B1SSWBSI", "BASSWBSI"), 
+  swb_acceptance_M2 = c("B1SSWBAO", "BASSWBAO"), 
+  swb_contribtuion_M2 = c("B1SSWBSC", "BASSWBSC"),
+  swb_actualization_M2 = c("B1SSWBSA", "BASSWBSA"), 
+  badl_M2 = c("B1SBADL2", "BACBADL2"),
+  iadl_M2 = c("B1SMADL", "BACMADL"),
+  mpq_wellbeing_M2 = c("B1SMPQWB", "BASMPQWB"), 
+  mpq_socpotency_M2 = c("B1SMPQSP", "BASMPQSP"), 
+  mpq_achieve_M2 = c("B1SMPQAC", "BASMPQAC"), 
+  mpq_socclose_M2 = c("B1SMPQSC", "BASMPQSC"), 
+  mpq_stressreact_M2 = c("B1SMPQSR", "BASMPQSR"), 
+  mpq_aggression_M2 = c("B1SMPQAG", "BASMPQAG"), 
+  mpq_alienation_M2 = c("B1SMPQAL", "BASMPQAL"), 
+  mpq_control_M2 = c("B1SMPQCN", "BASMPQCN"), 
+  mpq_tradition_M2 = c("B1SMPQTR", "BASMPQTR"),
+  mpq_harmavoid_M2 = c("B1SMPQHA", "BASMPQHA"), 
+  fmly_affectsolidarity_M2 = c("B1SFAMSO", "BACFAMSO"), 
+  frnd_affectsolidarity_M2 = c("B1SFDSOL", "BACFDSOL"), 
+  affneg_M2 = c("B1SNEGAF", "BACNEGAF"),
+  affpos_M2 = c("B1SPOSAF", "BACPOSAF"), 
+  health_R1 = c("RA1PA1", "RAACA1"),
+  mehealth_R1 = c("RA1PA2", "RAACA2"),
+  pwb_autonomy_R1 = c("RA1SPWBA2", "RAASPWBA2"),
+  pwb_environment_R1 = c("RA1SPWBE2", "RAASPWBE2"), 
+  pwb_growth_R1 = c("RA1SPWBG2", "RAASPWBG2"), 
+  pwb_relations_R1 = c("RA1SPWBR2", "RAASPWBR2"),
+  pwb_purpose_R1 = c("RA1SPWBU2", "RAASPWBU2"), 
+  pwb_acceptance_R1 = c("RA1SPWBS2", "RAASPWBS2"), 
+  swb_meaningful_R1 = c("RA1SSWBMS", "RAASSWBMS"), 
+  swb_integration_R1 = c("RA1SSWBSI", "RAASSWBSI"), 
+  swb_acceptance_R1 = c("RA1SSWBAO", "RAASSWBAO"), 
+  swb_contribtuion_R1 = c("RA1SSWBSC", "RAASSWBSC"),
+  swb_actualization_R1 = c("RA1SSWBSA", "RAASSWBSA"), 
+  badl_R1 = c("RA1SBADL2", "RAACBADL2"),
+  iadl_R1 = c("RA1SMADL", "RAACMADL"),
+  mpq_wellbeing_R1 = c("RA1SMPQWB", "RAASMPQWB"), 
+  mpq_socpotency_R1 = c("RA1SMPQSP", "RAASMPQSP"), 
+  mpq_achieve_R1 = c("RA1SMPQAC", "RAASMPQAC"), 
+  mpq_socclose_R1 = c("RA1SMPQSC", "RAASMPQSC"), 
+  mpq_stressreact_R1 = c("RA1SMPQSR", "RAASMPQSR"), 
+  mpq_aggression_R1 = c("RA1SMPQAG", "RAASMPQAG"), 
+  mpq_alienation_R1 = c("RA1SMPQAL", "RAASMPQAL"), 
+  mpq_control_R1 = c("RA1SMPQCN", "RAASMPQCN"), 
+  mpq_tradition_R1 = c("RA1SMPQTR", "RAASMPQTR"),
+  mpq_harmavoid_R1 = c("RA1SMPQHA", "RAASMPQHA"), 
+  fmly_affectsolidarity_R1 = c("RA1SFAMSO", "RAASFAMSO"), 
+  frnd_affectsolidarity_R1 = c("RA1SFDSOL", "RAASFDSOL"), 
+  affneg_R1 = c("RA1SNEGAF", "RAACNEGAF"),
+  affpos_R1 = c("RA1SPOSAF", "RAACPOSAF")
+)
+
+dv <- reduce(names(pairsdv), function(df, name) {
+  vars <- pairsdv[[name]]
+  if (all(vars %in% names(df))) {
+    df <- mutate(df, !!name := coalesce(df[[vars[1]]], df[[vars[2]]]))
+  }
+  df
+}, .init = dv)
+
+head(dv)
+
+dv <- dv[, c("MIDUSID", "M2ID", "MRID", "SAMPLMAJ", "DOD_M", "DOD_Y", names(pairsdv))]
+
+#####################
+#recoding & cleaning#
+#M2 SFI-10 vars#
+#####################
+dv$neighborhood_clean_M2 <- ifelse(dv$neighborhood_clean_M2 == -1, NA, 
+                                   ifelse(dv$neighborhood_clean_M2 == 8, NA, 
+                                          dv$neighborhood_clean_M2))
+
+dv$financial_control_M2 <- ifelse(dv$financial_control_M2 == 98, NA,
+                                  ifelse(dv$financial_control_M2 == -1, NA,
+                                         dv$financial_control_M2))
+
+dv$family_contact_M2 <- ifelse(dv$family_contact_M2 == 98, NA,
+                               ifelse(dv$family_contact_M2 == -1, NA, 
+                                      dv$family_contact_M2))
+
+dv$friends_contact_M2 <- ifelse(dv$friends_contact_M2 == 98, NA, 
+                                ifelse(dv$friends_contact_M2 == -1, NA, 
+                                       dv$friends_contact_M2)) 
+
+#recode work to binary currently working/not working
+dv$work_M2 <- ifelse(dv$work_M2 >= 97, NA, 
+                     ifelse(dv$work_M2 %in% c(1, 2, 4, 9), 1, 0))
+
+#create volunteer variable, excluding volunteering at school/with other youth#
+volunteer <- names(dv)[grep("^volunteer", names(dv))]
+list(volunteer)
+
+dv[volunteer] <- lapply(dv[volunteer], function(x) ifelse(x == -1, NA, 
+                                                          ifelse(x == 998, NA, x)))
+
+dv$volunteer_M2 <- rowSums(dv[, c("volunteerhn_M2", "volunteerpoc_M2", "volunteerother_M2")], na.rm = FALSE)
+
+#create feels isolated/loneliness#
+lonelinesscols2 <- c("lonely_M2", "close_M2", "belong_M2")
+dv[lonelinesscols2] <- lapply(dv[lonelinesscols2], function(x) ifelse(x == -1, NA, 
+                                                                      ifelse(x == 8, NA, x)))
+
+dv$lonely_M2 <- 6 - dv$lonely_M2
+
+dv$loneliness_M2 <- rowSums(dv[, c("lonely_M2", "close_M2", "belong_M2")], na.rm = FALSE)
+
+dv$loneliness_M2 <- dv$loneliness_M2 - 2
+dv$loneliness_M2 <- 14 - dv$loneliness_M2
+
+#create treated with less courtesy or respect than others#
+court_resp2 <- c("courtesy_M2", "respect_M2")
+dv[court_resp2] <- lapply(dv[court_resp2], function(x) ifelse(x == -1, NA, 
+                                                              ifelse(x == 8, NA, x)))
+
+dv$courtresp_M2 <- rowSums(dv[, c("courtesy_M2", "respect_M2")], na.rm = FALSE)
+
+dv$courtresp_M2 <- dv$courtresp_M2 - 1
+
+#####################
+#recoding & cleaning#
+#R1 SFI-10 vars#
+#####################
+dv$neighborhood_clean_R1 <- ifelse(dv$neighborhood_clean_R1 == -1, NA, 
+                                   ifelse(dv$neighborhood_clean_R1 == 8, NA, 
+                                          dv$neighborhood_clean_R1))
+
+dv$financial_control_R1 <- ifelse(dv$financial_control_R1 == 98, NA,
+                                  ifelse(dv$financial_control_R1 == -1, NA,
+                                         dv$financial_control_R1))
+
+dv$family_contact_R1 <- ifelse(dv$family_contact_R1 == 98, NA,
+                               ifelse(dv$family_contact_R1 == -1, NA, 
+                                      dv$family_contact_R1))
+
+dv$friends_contact_R1 <- ifelse(dv$friends_contact_R1 == 98, NA, 
+                                ifelse(dv$friends_contact_R1 == -1, NA, 
+                                       dv$friends_contact_R1)) 
+
+#recode work to binary currently working/not working
+dv$work_R1 <- ifelse(dv$work_R1 >= 97, NA, 
+                     ifelse(dv$work_R1 %in% c(1, 2, 4, 9), 1, 0))
+
+#create volunteer variable, excluding volunteering at school/with other youth#
+dv$volunteer_R1 <- rowSums(dv[, c("volunteerhn_R1", "volunteerpoc_R1", "volunteerother_R1")], na.rm = FALSE)
+
+#create feels isolated/loneliness#
+lonelinesscolsR <- c("lonely_R1", "close_R1", "belong_R1")
+dv[lonelinesscolsR] <- lapply(dv[lonelinesscolsR], function(x) ifelse(x == -1, NA, 
+                                                                      ifelse(x == 8, NA, x)))
+
+dv$lonely_R1 <- 6 - dv$lonely_R1
+
+dv$loneliness_R1 <- rowSums(dv[, c("lonely_R1", "close_R1", "belong_R1")], na.rm = FALSE)
+
+dv$loneliness_R1 <- dv$loneliness_R1 - 2
+dv$loneliness_R1 <- 14 - dv$loneliness_R1
+
+#create treated with less courtesy or respect than others#
+court_respR <- c("courtesy_R1", "respect_R1")
+dv[court_respR] <- lapply(dv[court_respR], function(x) ifelse(x == -1, NA, 
+                                                              ifelse(x == 8, NA, x)))
+
+dv$courtresp_R1 <- rowSums(dv[, c("courtesy_R1", "respect_R1")], na.rm = FALSE)
+
+dv$courtresp_R1 <- dv$courtresp_R1 - 1
+
+#####################
+#recoding & cleaning#
+#criterion vars#
+#####################
+#physical & mental health#
+dv$health_M2[dv$health_M2 == 7] <- NA
+dv$mehealth_M2[dv$mehealth_M2 == 7] <- NA
+dv$health_R1[dv$health_R1 == 7] <- NA
+dv$mehealth_R1[dv$mehealth_R1 == 7] <- NA
+
+dv$health_M2 <- 6 - dv$health_M2
+dv$mehealth_M2 <- 6 - dv$mehealth_M2
+dv$health_R1 <- 6 - dv$health_R1
+dv$mehealth_R1 <- 6 - dv$mehealth_R1
+
+#pwb scales#
+pwb <- names(dv)[grep("^pwb", names(dv))]
+list(pwb)
+
+dv[pwb] <- lapply(dv[pwb], function(x) ifelse(x == -1, NA, 
+                                                ifelse(x == 98, NA, x)))
+
+#swb scales#
+swb <- names(dv)[grep("^swb", names(dv))]
+list(swb)
+
+dv[swb] <- lapply(dv[swb], function(x) ifelse(x == -1, NA, 
+                                              ifelse(x == 98, NA, x)))
+
+#adls#
+#basic#
+dv$badl_M2[dv$badl_M2 == -1] <- NA
+dv$badl_R1[dv$badl_R1 == -1] <- NA
+dv$badl_M2[dv$badl_M2 == 8] <- NA
+dv$badl_R1[dv$badl_R1 == 8] <- NA
+
+#instrumental
+dv$iadl_M2[dv$iadl_M2 == -1] <- NA
+dv$iadl_R1[dv$iadl_M2 == -1] <- NA
+dv$iadl_M2[dv$iadl_M2 == 8] <- NA
+dv$iadl_R1[dv$iadl_M2 == 8] <- NA
+
+#mpq scales#
+mpq <- names(dv)[grep("^mpq", names(dv))]
+list(mpq)
+
+dv[mpq] <- lapply(dv[mpq], function(x) ifelse(x == -1, NA, 
+                                              ifelse(x == 98, NA, x)))
+
+#affect scales#
+aff <- names(dv)[grep("^aff", names(dv))]
+list(aff)
+
+dv[aff] <- lapply(dv[aff], function(x) ifelse(x == -1, NA, 
+                                              ifelse(x == 8, NA, x)))
+
+#relationship quality scales#
+#family#
+fmly <- names(dv)[grep("^fmly", names(dv))]
+list(fmly)
+
+dv[fmly] <- lapply(dv[fmly], function(x) ifelse(x == -1, NA, 
+                                              ifelse(x == 8, NA, x)))
+
+#friends#
+frnd <- names(dv)[grep("^frnd", names(dv))]
+list(frnd)
+
+dv[frnd] <- lapply(dv[frnd], function(x) ifelse(x == -1, NA, 
+                                              ifelse(x == 8, NA, x)))
+
+#####################
+#further tidying#
+#####################
+#subset by sample#
+M2 <- df[, grep("_M2$", names(df))]
+M2 <- cbind(M2, df$MIDUSID, df$SAMPLMAJ)
+colnames(M2)[colnames(M2) == "df$MIDUSID"] <- "MIDUSID"
+colnames(M2)[colnames(M2) == "df$SAMPLMAJ"] <- "SAMPLMAJ"
+
+R1 <- df[, grep("_R1$", names(df))]
+R1 <- cbind(R1, df$MIDUSID, df$SAMPLMAJ)
+colnames(R1)[colnames(R1) == "df$MIDUSID"] <- "MIDUSID"
+colnames(R1)[colnames(R1) == "df$SAMPLMAJ"] <- "SAMPLMAJ"
+
+#complete cases for M2#
+pwbM2 <- names(M2)[grep("^pwb", names(M2))]
+list(pwbM2)
+
+swbM2 <- names(M2)[grep("^swb", names(M2))]
+list(swbM2)
+
+mpqM2 <- names(M2)[grep("^mpq", names(M2))]
+list(mpqM2)
+
+affM2 <- names(M2)[grep("^aff", names(M2))]
+list(affM2)
+
+frndM2 <- names(M2)[grep("^frnd", names(M2))]
+list(frndM2)
+
+fmlyM2 <- names(M2)[grep("^fmly", names(M2))]
+list(fmlyM2)
+
+dfM2 <- M2[complete.cases(M2[, c("health_M2", "mehealth_M2","badl_M2", 
+                                 "iadl_M2", pwbM2, swbM2, mpqM2, affM2, 
+                                 frndM2, fmlyM2)]), ]
+
+dfM2 <- dfM2[dfM2$age_M2 >= 40 & dfM2$age_M2 <= 75, ]
+view(dfM2)
+
+#complete cases for R1#
+pwbR1 <- names(R1)[grep("^pwb", names(R1))]
+list(pwbR1)
+
+swbR1 <- names(R1)[grep("^swb", names(R1))]
+list(swbR1)
+
+mpqR1 <- names(R1)[grep("^mpq", names(R1))]
+list(mpqR1)
+
+affR1 <- names(R1)[grep("^aff", names(R1))]
+list(affR1)
+
+frndR1 <- names(R1)[grep("^frnd", names(R1))]
+list(frndR1)
+
+fmlyR1 <- names(R1)[grep("^fmly", names(R1))]
+list(fmlyR1)
+
+dfR1 <- R1[complete.cases(R1[, c("health_R1", "mehealth_R1","badl_R1", 
+                                 pwbR1, swbR1, mpqR1, affR1, 
+                                 frndR1, fmlyR1)]), ]
+dfR1 <- dfR1[dfR1$age_R1 >= 40 & dfR1$age_R1 <= 75, ]
+view(dfR1)
+
+
+#####################
+#making 4 yr mortality binary#
+#1 = yes, 0 = no variable#
+#####################
+#Add DOD#
+dod <- df[, c(1, 5, 6)]
+dfM2 <- merge(dfM2, dod, by = "MIDUSID", all.x = FALSE)
+dfR1 <- merge(dfR1, dod, by = "MIDUSID", all.x = FALSE)
+
+#basing 4yr mortality calculation on Shah et al.'s ACTUAL criteria (not 4yr mortality)#
+#via Sachin: "We mentioned "4-year mortality" in the paper, but the way we defined the#
+#death_flag (the outcome, a binary indicator) was to include all deaths that occurred by#
+#the end of 2015 (Dec 31, 2015) for the 2010 cohort.#
+
+#extrapolating this to M2 and R1#
+
+#M2#
+#counting all deaths before December 31st, 2009#
+
+#R1 consisted of two samples: MRY, MRO#
+#MRY = ages 25-54; conducted interviews between November 2011 and October 2012#
+#MRO = ages 55-75; conducted interviews between July 2013 and May 2014#
+#As these two samples were interviewed at different times, need to apply#
+#different mortality date cutoffs based on Sachin's criteria for each sample#
+#MRY counting all deaths before December 31st, 2016#
+#MRO counting all deaths before December 31st, 2018#
+
+#note: dates cannot be narrowed down from months#
+#note: <= 2010 because December, 2009 would be 2009 + 1#
+#in the formula below, so 2010. Same applies for others#
+
+#dfM2#
+dfM2$DOD <- dfM2$DOD_Y + dfM2$DOD_M/12
+dfM2$mortality <- ifelse(is.na(dfM2$DOD), 0,
+                         ifelse(dfM2$DOD <= 2010, 1, 0))
+
+table(dfM2$mortality == 1)
+
+#dfR1#
+dfR1$DOD <- dfR1$DOD_Y + dfR1$DOD_M/12
+dfR1$mortality <- ifelse(is.na(dfR1$DOD), 0,
+                         ifelse(dfR1$age_R1 < 55 & dfR1$DOD <= 2017, 1,
+                                ifelse(dfR1$age_R1 >= 55 & dfR1$DOD <= 2019, 1, 0)))
+
+table(dfR1$mortality == 1)
+
+#just checking when died#
+dfM2$interview_M2 <- dfM2$interview_Y_M2 + dfM2$interview_M_M2/12
+dfM2$mortalitytime <- dfM2$DOD - dfM2$interview_M2
+
+summary(dfM2$mortalitytime[dfM2$mortality == 1])
+hist(dfM2$mortalitytime[dfM2$mortality == 1], breaks = "sturges", freq = FALSE,
+     xlim = c(0, 6), ylim = c(0, 0.35),
+     main = "M2 Cohort: Mortality Time", xlab = "Time (Years)")
+lines(density(dfM2$mortalitytime[dfM2$mortality == 1]), col = "#27933E")
+
+dfR1$interview_R1 <- dfR1$interview_Y_R1 + dfR1$interview_M_R1/12
+dfR1$mortalitytime <- dfR1$DOD - dfR1$interview_R1
+
+summary(dfR1$mortalitytime[dfR1$mortality == 1])
+hist(dfR1$mortalitytime[dfR1$mortality == 1], breaks = "sturges", freq = FALSE,
+     xlim = c(0, 6), ylim = c(0, 0.35),
+     main = "R1 Cohort: Mortality Time", xlab = "Time (Years)")
+lines(density(dfR1$mortalitytime[dfR1$mortality == 1]), col = "#27933E")
+```
+
+
+# Descriptive stats - demographics, health status, function
+
+The following 2 sections can be combined to recreate the descriptive statistics in Table S1.
+
+### M2
+
+```{r}
+#merge in descriptive stats sheet#
+desc <- read_excel("/sourcedirectory/M2 MR1 SFI Descriptive Stats.xlsx", col_names = TRUE, guess_max = 12000)
+
+pairsdesc <- list(
+  stroke_M2 = c("B1PA6A", "BACA6A"),
+  cancer_M2 = c("B1PA26", "BACA26"), 
+  brstcancer_M2 = c("B1PA28A", "BACA28A"),
+  cervcancer_M2 = c("B1PA28B", "BACA28B"),
+  colcancer_M2 = c("B1PA28C", "BACA28C"),
+  lungcancer_M2 = c("B1PA28D", "BACA28D"),
+  lympleuk_M2 = c("B1PA28E", "BACA28E"),
+  ovarcancer_M2 = c("B1PA28F", "BACA28F"),
+  prostcancer_M2 = c("B1PA28G", "BACA28G"),
+  utercancer_M2 = c("B1PA28I", "BACA28I"),
+  skincancer_M2 = c("B1PA28H", "BACA28H"),
+  smokeev_M2 = c("B1PA38A", "BACA37"),
+  smoken_M2 = c("B1PA39", "BACA39"),
+  depress_M2 = c("B1PDEPAD", "BACDEPAD"),
+  heartd_M2 = c("B1PA7", "BACA7"),
+  diabetes_M2 = c("B1SA11X", "BACAS11X"),
+  jointbone_M2 = c("B1SA11D", "BACAS11D"),
+  race_M2 = c("B1PF7A", "BACF7A"),
+  ethnicity_M2 = c("B1PF1", "BACF1"),
+  educ_M2 = c("B1PB1", "BACB1"),
+  hincome_M2 = c("B1STINC1", "BACTINC1"),
+  mstat_M2 = c("B1PB19", "BACB19"),
+  stroke_R1 = c("RA1PA6A", "RAACA6A"),
+  cancer_R1 = c("RA1PA26", "RAACA26"), 
+  brstcancer_R1 = c("RA1PA28A", "RAACA28A"), 
+  cervcancer_R1 = c("RA1PA28B", "RAACA28B"),
+  colcancer_R1 = c("RA1PA28C", "RAACA28C"),
+  lungcancer_R1 = c("RA1PA28D", "RAACA28D"),
+  lympleuk_R1 = c("RA1PA28E", "RAACA28E"),
+  ovarcancer_R1 = c("RA1PA28F", "RAACA28F"),
+  prostcancer_R1 = c("RA1PA28G", "RAACA28G"),
+  utercancer_R1 = c("RA1PA28I", "RAACA28I"),
+  skincancer_R1 = c("RA1PA28H", "RAACA28H"),
+  smokeev_R1 = c("RA1PA38A", "RAACA37"),
+  smoken_R1 = c("RA1PA39", "RAACA39"),
+  depress_R1 = c("RA1PDEPAD", "RAACDEPAD"),
+  heartd_R1 = c("RA1PA7", "RAACA7"),
+  diabetes_R1 = c("RA1SA11X", "RAACAS11X"),
+  jointbone_R1 = c("RA1SA11D", "RAACAS11D"),
+  race_R1 = c("RA1PF7A", "RAACF7A"),
+  ethnicity_R1 = c("RA1PF1", "RAACF1"),
+  educ_R1 = c("RA1PB1", "RAACB1"),
+  hincome_R1 = c("RA1STINC", "RAACTINC"),
+  mstat_R1 = c("RA1PB19", "RAACB19")
+)
+
+desc <- reduce(names(pairsdesc), function(df, name) {
+  vars <- pairsdesc[[name]]
+  if (all(vars %in% names(df))) {
+    df <- mutate(df, !!name := coalesce(df[[vars[1]]], df[[vars[2]]]))
+  }
+  df
+}, .init = desc)
+
+head(desc)
+
+desc <- desc[, c("MIDUSID", "M2ID", "MRID", "SAMPLMAJ", names(pairsdesc))]
+
+dfM2 <- merge(dfM2, desc, by = c("MIDUSID", "SAMPLMAJ"), all.x = TRUE)
+view(dfM2)
+
+#tidy#
+cancerM2 <- c("brstcancer_M2", "cervcancer_M2", "colcancer_M2", "lungcancer_M2", 
+              "lympleuk_M2", "ovarcancer_M2", "prostcancer_M2", "utercancer_M2")
+
+dfM2[cancerM2] <- lapply(dfM2[cancerM2], function(x) ifelse(x == 7, NA,
+                                                          ifelse(x == 8, NA, 
+                                                              ifelse(x == 9, NA, x))))
+
+dfM2$cancerflag_M2 <- ifelse((dfM2$cancer_M2 == 1) &
+                                !(dfM2$skincancer_M2 == 1 & 
+                                    rowSums(dfM2[cancerM2] == 1, na.rm = TRUE) == 0), 1, 2)
+
+#####################
+#demographics#
+#####################
+#age (median+IQR)#
+summary(dfM2$age_M2)
+hist(dfM2$age_M2, breaks = "sturges", freq = FALSE,
+      main = "M2 Cohort: Age", xlab = "Years")
+lines(density(dfM2$age_M2), col = "#27933E")
+
+#sex (female+%)#
+table(dfM2$sex_M2 == 2)
+
+#####################
+#health status#
+#####################
+#fair or poor self reported health (N+%)#
+table(dfM2$health_M2 >= 4)
+
+#diabetes (N+%)#
+table(dfM2$diabetes_M2)
+
+#cancer (excluding minor skin cancer) (N+%)#
+table(dfM2$cancerflag_M2 == 1)
+
+#heart disease (N+%)#
+table(dfM2$heartd_M2 == 1)
+
+#stroke (N+%)#
+table(dfM2$stroke_M2 == 1)
+
+#arthritis (N+%)#
+table(dfM2$jointbone_M2)
+
+#depression (MDE in past 12mo) (N+%)#
+table(dfM2$depress_M2 == 1)
+
+#hx of smoking (N+%)#
+table(dfM2$smokeev_M2 == 1)
+
+#current smoker? (N+%)#
+table(dfM2$smoken_M2 == 1)
+
+#####################
+#mortality#
+#####################
+#mortality#
+table(dfM2$mortality)
+
+
+#####################
+#summarize#
+#####################
+N <- 3542
+
+freq_percent <- function(var, condition) {
+  freq <- sum(var %in% condition, na.rm = TRUE)  
+  perc <- (freq / N) * 100              
+  return(paste0(freq, " (", round(perc, 2), "%)"))
+}
+
+freq_percentlog <- function(var, condition) {
+  freq <- sum(condition, na.rm = TRUE)
+  perc <- (freq / length(var)) * 100
+  paste0(freq, " (", round(perc, 2), "%)")
+}
+
+M2stats <- data.frame(
+  Variable = c(
+    "Fair or Poor Self-Reported Health",
+    "Diabetes",
+    "Cancer (excluding minor skin cancer)",
+    "Heart Disease",
+    "Stroke",
+    "Bone/Joint Disease",
+    "Depression",
+    "Current Smoker",
+    "Former Smoker"
+  ),
+  `N (%)` = c(
+    freq_percent(dfM2$health_M2, c(4, 5)), 
+    freq_percent(dfM2$diabetes_M2, 1),  
+    freq_percent(dfM2$cancerflag_M2, 1),  
+    freq_percent(dfM2$heartd_M2, 1),  
+    freq_percent(dfM2$stroke_M2, 1),  
+    freq_percent(dfM2$jointbone_M2, 1),  
+    freq_percent(dfM2$depress_M2, 1),  
+    freq_percent(dfM2$smoken_M2, 1),  
+    freq_percent(dfM2$smokeev_M2[dfM2$smoken_M2 == 2], 1)
+  )
+)
+
+write.csv(M2stats, file.path(outdir, "M2 health and function.csv"), row.names = TRUE)
+```
+
+### R1
+
+```{r}
+dfR1 <- merge(dfR1, desc, by = c("MIDUSID", "SAMPLMAJ"), all.x = TRUE)
+view(dfR1)
+
+#tidy#
+cancerR1 <- c("brstcancer_R1", "cervcancer_R1", "colcancer_R1", "lungcancer_R1", 
+              "lympleuk_R1", "ovarcancer_R1", "prostcancer_R1", "utercancer_R1")
+
+dfR1[cancerR1] <- lapply(dfR1[cancerR1], function(x) ifelse(x == 7, NA,
+                                                          ifelse(x == 8, NA, 
+                                                              ifelse(x == 9, NA, x))))
+
+dfR1$cancerflag_R1 <- ifelse((dfR1$cancer_R1 == 1) &
+                                !(dfR1$skincancer_R1 == 1 & 
+                                    rowSums(dfR1[cancerR1] == 1, na.rm = TRUE) == 0), 1, 2)
+
+#####################
+#demographics#
+#####################
+#age (median+IQR)#
+summary(dfR1$age_R1)
+hist(dfR1$age_R1, breaks = "sturges", freq = FALSE, 
+      main = "R1 Cohort: Age", xlab = "Years")
+lines(density(dfR1$age_R1), col = "#27933E")
+
+#sex (female+%)#
+table(dfR1$sex_R1 == 2)
+
+#####################
+#health status#
+#####################
+#fair or poor self reported health (N+%)#
+table(dfR1$health_R1 >= 4)
+
+#diabetes (N+%)#
+table(dfR1$diabetes_R1)
+
+#cancer (excluding minor skin cancer) (N+%)#
+table(dfR1$cancerflag_R1 == 1)
+
+#heart disease (N+%)#
+table(dfR1$heartd_R1 == 1)
+
+#stroke (N+%)#
+table(dfR1$stroke_R1 == 1)
+
+#arthritis (N+%)#
+table(dfR1$jointbone_R1)
+
+#depression (MDE in past 12mo) (N+%)#
+table(dfR1$depress_R1 == 1)
+
+#hx of smoking (N+%)#
+table(dfR1$smokeev_R1 == 1)
+
+#current smoker? (N+%)#
+table(dfR1$smoken_R1 == 1)
+
+#####################
+#mortality#
+#####################
+#mortality#
+table(dfR1$mortality)
+
+
+#####################
+#summarize#
+#####################
+N <- 2077
+
+R1stats <- data.frame(
+  Variable = c(
+    "Fair or Poor Self-Reported Health",
+    "Diabetes",
+    "Cancer (excluding minor skin cancer)",
+    "Heart Disease",
+    "Stroke",
+    "Bone/Joint Disease",
+    "Depression",
+    "Current Smoker",
+    "Former Smoker"
+  ),
+  `N (%)` = c(
+    freq_percent(dfR1$health_R1, c(4, 5)), 
+    freq_percent(dfR1$diabetes_R1, 1),  
+    freq_percent(dfR1$cancerflag_R1, 1),  
+    freq_percent(dfR1$heartd_R1, 1),  
+    freq_percent(dfR1$stroke_R1, 1),  
+    freq_percent(dfR1$jointbone_R1, 1),  
+    freq_percent(dfR1$depress_R1, 1),  
+    freq_percent(dfR1$smoken_R1, 1),  
+    freq_percent(dfR1$smokeev_R1[dfR1$smoken_R1 == 2], 1)  
+  )
+)
+
+write.csv(R1stats, file.path(outdir, "R1 health and function.csv"), row.names = TRUE)
+```
+
+
+# Descriptive stats - social characteristics
+
+### M2
+
+```{r}
+#####################
+#general resources#
+#####################
+#race (N+%)#
+table(dfM2$race_M2)
+
+#ethnicity (N+%)#
+table(dfM2$ethnicity_M2)
+
+#education (N+%)#
+table(dfM2$educ_M2)
+
+#income (N+%)#
+summary(dfM2$hincome_M2)
+dfM2$hincome_M2[dfM2$hincome_M2 == -1 ] <- NA
+dfM2$hincome_M2[dfM2$hincome_M2 == 9999998 ] <- NA
+
+summary(dfM2$hincome_M2)
+hist(dfM2$hincome_M2, breaks = "sturges", freq = FALSE, 
+     main = "M2 Cohort: Household Income", xlab = "Annual Income (USD)")
+lines(density(dfM2$hincome_M2, na.rm = TRUE), col = "#27933E")
+
+#marital status (N+%)#
+table(dfM2$mstat_M2)
+
+#####################
+#sfi vars#
+#####################
+#all tables based on functional forms analysis in HRS#
+#neighborhood unclean#
+#code (< 3) to (0); (>= 3) to (1)#
+table(dfM2$neighborhood_clean_M2 >= 3)
+
+#low financial control#
+#code (< 2) to (0); (>= 2) to (1)#
+table(dfM2$financial_control_M2 < 2)
+
+#low family contact#
+#code (< 7) to (0); (>= 7) to (1)#
+table(dfM2$family_contact_M2 >= 7)
+
+#friend frequency#
+summary(dfM2$friends_contact_M2)
+
+#work#
+table(dfM2$work_M2 == 1)
+
+#no volunteer#
+table(dfM2$volunteer_M2 == 0)
+
+#loneliness#
+table(dfM2$loneliness_M2)
+
+#less courtesy/respect#
+#code (< 5) to (0); (>= 5) to (1)#
+table(dfM2$courtresp_M2 < 5)
+
+#####################
+#summarize#
+#####################
+N = 3542
+
+M2descstats <- data.frame(
+  Variable = c(
+    "Black",
+    "White",
+    "Other", 
+    "Hispanic origin", 
+    "Not of hispanic origin", 
+    "Less than high school", 
+    "High school diploma or equiv", 
+    "Some college", 
+    "College and above",
+    "< $56,599", 
+    "$56,600 - 169,799", 
+    "> $169,800", 
+    "Age", 
+    "Sex", 
+    "Neighborhood is not clean", 
+    "Low percieved financial control", 
+    "Meets with children less than once per year or equivalent", 
+    "Presently working", 
+    "Does no volunteer/charity work", 
+    "Feels isolated often", 
+    "Feels isolated some of the time", 
+    "Feels isolated hardly ever or never",
+    "Often treated with less courtesy and respect than others"
+  ),
+  `N (%)` = c(
+    freq_percent(dfM2$race_M2, 2),
+    freq_percent(dfM2$race_M2, 1),
+    freq_percent(dfM2$race_M2, 3:6),
+    freq_percent(dfM2$ethnicity_M2, 2:7), 
+    freq_percent(dfM2$ethnicity_M2, 1),
+    freq_percent(dfM2$educ_M2, 1:3),
+    freq_percent(dfM2$educ_M2, 4:5),
+    freq_percent(dfM2$educ_M2, 6:7),
+    freq_percent(dfM2$educ_M2, 8:12),
+    freq_percentlog(dfM2$hincome_M2, dfM2$hincome_M2 < 56600),
+    freq_percentlog(dfM2$hincome_M2, dfM2$hincome_M2 >= 56600 & dfM2$hincome_M2 <= 169799),
+    freq_percentlog(dfM2$hincome_M2, dfM2$hincome_M2 > 169799),
+    paste0(round(median(dfM2$age_M2), 2), 
+           " [", round(summary(dfM2$age_M2)[2], 2),",", 
+           round(summary(dfM2$age_M2)[5], 2), "]"), 
+    freq_percent(dfM2$sex_M2, 2), 
+    freq_percent(dfM2$neighborhood_clean_M2, 3:4), 
+    freq_percent(dfM2$financial_control_M2, 0:1), 
+    freq_percent(dfM2$family_contact_M2, 7:8), 
+    #manually computed friends contact#
+    freq_percent(dfM2$work_M2, 1), 
+    freq_percent(dfM2$volunteer_M2, 0), 
+    freq_percent(dfM2$loneliness_M2, 1:5), 
+    freq_percent(dfM2$loneliness_M2, 6:10),
+    freq_percent(dfM2$loneliness_M2, 11:13),
+    freq_percent(dfM2$courtresp_M2, 1:4)
+  )
+)
+
+write.csv(M2descstats, file.path(outdir, "M2 descriptive stats.csv"), row.names = TRUE)
+```
+
+### R1
+
+```{r}
+#####################
+#general resources#
+#####################
+#race (N+%)#
+table(dfR1$race_R1)
+
+#ethnicity (N+%)#
+table(dfR1$ethnicity_R1)
+
+#education (N+%)#
+table(dfR1$educ_R1)
+
+#income (N+%)#
+summary(dfR1$hincome_R1)
+dfR1$hincome_R1[dfR1$hincome_R1 == -1 ] <- NA
+dfR1$hincome_R1[dfR1$hincome_R1 == 999998 ] <- NA
+
+summary(dfR1$hincome_R1)
+hist(dfR1$hincome_R1, breaks = "sturges", freq = FALSE, 
+     main = "R1 Cohort: Household Income", xlab = "Annual Income (USD)")
+lines(density(dfR1$hincome_R1, na.rm = TRUE), col = "#27933E")
+
+
+#marital status (N+%)#
+table(dfR1$mstat_R1)
+
+#####################
+#sfi vars#
+#####################
+#all tables based on functional forms analysis in HRS#
+#neighborhood unclean#
+#code (< 3) to (0); (>= 3) to (1)#
+table(dfR1$neighborhood_clean_R1 >= 3)
+
+#low financial control#
+#code (< 2) to (0); (>= 2) to (1)#
+table(dfR1$financial_control_R1 < 2)
+
+#low family contact#
+#code (< 7) to (0); (>= 7) to (1)#
+table(dfR1$family_contact_R1 >= 7)
+
+#friend frequency#
+summary(dfR1$friends_contact_R1)
+
+#work#
+table(dfR1$work_R1 == 1)
+
+#no volunteer#
+table(dfR1$volunteer_R1 == 0)
+
+#loneliness#
+table(dfR1$loneliness_R1)
+
+#less courtesy/respect#
+#code (< 5) to (0); (>= 5) to (1)#
+table(dfR1$courtresp_R1 < 5)
+
+#####################
+#summarize#
+#####################
+N = 2077
+
+R1descstats <- data.frame(
+  Variable = c(
+    "Black",
+    "White",
+    "Other", 
+    "Hispanic origin", 
+    "Not of hispanic origin", 
+    "Less than high school", 
+    "High school diploma or equiv", 
+    "Some college", 
+    "College and above",
+    "< $56,599", 
+    "$56,600 - 169,799", 
+    "> $169,800", 
+    "Age", 
+    "Sex", 
+    "Neighborhood is not clean", 
+    "Low percieved financial control", 
+    "Meets with children less than once per year or equivalent", 
+    "Presently working", 
+    "Does no volunteer/charity work", 
+    "Feels isolated often", 
+    "Feels isolated some of the time", 
+    "Feels isolated hardly ever or never",
+    "Often treated with less courtesy and respect than others"
+  ),
+  `N (%)` = c(
+    freq_percent(dfR1$race_R1, 2),
+    freq_percent(dfR1$race_R1, 1),
+    freq_percent(dfR1$race_R1, 3:6),
+    freq_percent(dfR1$ethnicity_R1, 2:7), 
+    freq_percent(dfR1$ethnicity_R1, 1),
+    freq_percent(dfR1$educ_R1, 1:3),
+    freq_percent(dfR1$educ_R1, 4:5),
+    freq_percent(dfR1$educ_R1, 6:7),
+    freq_percent(dfR1$educ_R1, 8:12),
+    freq_percentlog(dfR1$hincome_R1, dfR1$hincome_R1 < 56600),
+    freq_percentlog(dfR1$hincome_R1, dfR1$hincome_R1 >= 56600 & dfR1$hincome_R1 <= 169799),
+    freq_percentlog(dfR1$hincome_R1, dfR1$hincome_R1 > 169799),
+    paste0(round(median(dfR1$age_R1), 2), 
+           " [", round(summary(dfR1$age_R1)[2], 2),",", 
+           round(summary(dfR1$age_R1)[5], 2), "]"), 
+    freq_percent(dfR1$sex_R1, 2), 
+    freq_percent(dfR1$neighborhood_clean_R1, 3:4), 
+    freq_percent(dfR1$financial_control_R1, 0:1), 
+    freq_percent(dfR1$family_contact_R1, 7:8), 
+    #manually computed friends contact#
+    freq_percent(dfR1$work_R1, 1), 
+    freq_percent(dfR1$volunteer_R1, 0), 
+    freq_percent(dfR1$loneliness_R1, 1:5), 
+    freq_percent(dfR1$loneliness_R1, 6:10),
+    freq_percent(dfR1$loneliness_R1, 11:13),
+    freq_percent(dfR1$courtresp_R1, 1:4)
+  )
+)
+
+write.csv(R1descstats, file.path(outdir, "R1 descriptive stats.csv"), row.names = TRUE)
+```
+
+
+# Find median (continuous) & mode values
+
+```{r}
+findmode <- function(x) {
+  freq_table <- table(x)
+  mode <- as.numeric(names(freq_table[freq_table == max(freq_table)]))
+  return(mode)
+}
+
+#######################
+#age (age_X)#
+#######################
+median(dfM2$age_M2, na.rm = TRUE)
+median(dfR1$age_R1, na.rm = TRUE)
+
+#median M2: 55#
+#median R1: 58#
+
+#######################
+#volunteer (volunteer_X)#
+#######################
+median(dfM2$volunteer_M2, na.rm = TRUE)
+median(dfR1$volunteer_R1, na.rm = TRUE)
+
+#median M2: 0#
+#median R1: 0#
+
+#######################
+#sex (sex_X)#
+#######################
+findmode(dfM2$sex_M2)
+findmode(dfR1$sex_R1)
+
+#mode M2: 2 (female)#
+#mode R1: 2 (female)#
+
+#######################
+#neighborhood clean#
+#(neighborhood_clean_X)#
+#######################
+findmode(dfM2$neighborhood_clean_M2)
+findmode(dfR1$neighborhood_clean_R1)
+
+#mode M2: 1 (highest agreement with "this area is kept very clean")#
+#mode R1: 1 (highest agreement with "this area is kept very clean")#
+
+#######################
+#financial control#
+#(financial_control_X)#
+#######################
+findmode(dfM2$financial_control_M2)
+findmode(dfR1$financial_control_R1)
+
+#mode M2: 8 (0 = "no control at all", 10 = "very much control")#
+#mode R1: 8 (0 = "no control at all", 10 = "very much control")#
+
+#######################
+#family contact#
+#(family_contact_X)#
+#######################
+findmode(dfM2$family_contact_M2)
+findmode(dfR1$family_contact_R1)
+
+#mode M2: 3 (several times a week)#
+#mode R1: 3 (several times a week)#
+
+#######################
+#friends contact#
+#(friends_contact_X)#
+#######################
+findmode(dfM2$friends_contact_M2)
+findmode(dfR1$friends_contact_R1)
+
+#mode M2: 3 (several times a week)#
+#mode R1: 3 (several times a week)#
+
+#######################
+#work#
+#(work_X)#
+#######################
+findmode(dfM2$work_M2)
+findmode(dfR1$work_R1)
+
+#mode: 1 (working currently)#
+#mode: 1 (working currently)#
+
+#######################
+#loneliness#
+#(loneliness_X)#
+#######################
+findmode(dfM2$loneliness_M2)
+findmode(dfR1$loneliness_R1)
+
+#mode M2: 11 (lower - bc reverse coded here to match HRS = more lonely)#
+#mode R1: 11 (lower - bc reverse coded here to match HRS = more lonely)#
+
+#######################
+#treated w/ less courtesy/respect#
+#(courtresp_X)#
+#######################
+findmode(dfM2$courtresp_M2)
+findmode(dfR1$courtresp_R1)
+
+#mode M2: 7 (lower = experienced, higher = not experienced)#
+#mode R1: 7 (lower = experienced, higher = not experienced)#
+```
+
+
+# Impute & recode
+
+```{r}
+##############################
+#impute & recode#
+##############################
+#age#
+table(!is.na(dfM2$age_M2))
+table(!is.na(dfR1$age_R1))
+
+#sex#
+table(!is.na(dfM2$sex_M2))
+table(!is.na(dfR1$sex_R1))
+
+dfM2$sex_M2[dfM2$sex_M2 == 1] <- 0
+dfM2$sex_M2[dfM2$sex_M2 == 2] <- 1
+
+dfR1$sex_R1[dfR1$sex_R1 == 1] <- 0
+dfR1$sex_R1[dfR1$sex_R1 == 2] <- 1
+
+#neighborhood cleanliness#
+table(!is.na(dfM2$neighborhood_clean_M2))
+table(!is.na(dfR1$neighborhood_clean_R1))
+
+dfM2$neighborhood_clean_M2[is.na(dfM2$neighborhood_clean_M2)] <- 1
+dfR1$neighborhood_clean_R1[is.na(dfR1$neighborhood_clean_R1)] <- 1
+
+table(!is.na(dfM2$neighborhood_clean_M2))
+table(!is.na(dfR1$neighborhood_clean_R1))
+
+#financial control#
+table(!is.na(dfM2$financial_control_M2))
+table(!is.na(dfR1$financial_control_R1))
+
+dfM2$financial_control_M2[is.na(dfM2$financial_control_M2)] <- 8
+dfR1$financial_control_R1[is.na(dfR1$financial_control_R1)] <- 8
+
+table(!is.na(dfM2$financial_control_M2))
+table(!is.na(dfR1$financial_control_R1))
+
+#family contact frequency#
+table(!is.na(dfM2$family_contact_M2))
+table(!is.na(dfR1$family_contact_R1))
+
+dfM2$family_contact_M2[is.na(dfM2$family_contact_M2)] <- 3
+dfR1$family_contact_R1[is.na(dfR1$family_contact_R1)] <- 3
+
+table(!is.na(dfM2$family_contact_M2))
+table(!is.na(dfR1$family_contact_R1))
+
+#friend contact frequency#
+table(!is.na(dfM2$friends_contact_M2))
+table(!is.na(dfR1$friends_contact_R1))
+
+dfM2$friends_contact_M2[is.na(dfM2$friends_contact_M2)] <- 3
+dfR1$friends_contact_R1[is.na(dfR1$friends_contact_R1)] <- 3
+
+table(!is.na(dfM2$friends_contact_M2))
+table(!is.na(dfR1$friends_contact_R1))
+
+#work status#
+table(!is.na(dfM2$work_M2))
+table(!is.na(dfR1$work_R1))
+
+dfM2$work_M2[is.na(dfM2$work_M2)] <- 1
+dfR1$work_R1[is.na(dfR1$work_R1)] <- 1
+
+table(!is.na(dfM2$work_M2))
+table(!is.na(dfR1$work_R1))
+
+#volunteer#
+table(!is.na(dfM2$volunteer_M2))
+table(!is.na(dfR1$volunteer_R1))
+
+dfM2$volunteer_M2[is.na(dfM2$volunteer_M2)] <- 0
+dfR1$volunteer_R1[is.na(dfR1$volunteer_R1)] <- 0
+
+table(!is.na(dfM2$volunteer_M2))
+table(!is.na(dfR1$volunteer_R1))
+
+#feels isolated/loneliness#
+table(!is.na(dfM2$loneliness_M2))
+table(!is.na(dfR1$loneliness_R1))
+
+dfM2$loneliness_M2[is.na(dfM2$loneliness_M2)] <- 11
+dfR1$loneliness_R1[is.na(dfR1$loneliness_R1)] <- 11
+
+table(!is.na(dfM2$loneliness_M2))
+table(!is.na(dfR1$loneliness_R1))
+
+#treated with less courtesy or respect than others#
+table(!is.na(dfM2$courtresp_M2))
+table(!is.na(dfR1$courtresp_R1))
+
+dfM2$courtresp_M2[is.na(dfM2$courtresp_M2)] <- 7
+dfR1$courtresp_R1[is.na(dfR1$courtresp_R1)] <- 7
+
+table(!is.na(dfM2$courtresp_M2))
+table(!is.na(dfR1$courtresp_R1))
+```
+
+
+# Recode vars to manual PNAS coding
+
+```{r}
+#######################
+#create dummy df for og coding#
+#######################
+dfM2ff <- dfM2
+dfM2og <- dfM2
+dfR1oc <- dfR1
+
+#neighborhood cleanliness#
+dfM2ff$neighborhood_clean_M2 <- ifelse(dfM2ff$neighborhood_clean_M2 == 1, 0, 
+                                ifelse(dfM2ff$neighborhood_clean_M2 == 2, 0, 1))
+
+
+table(dfM2ff$neighborhood_clean_M2)
+
+#financial control#
+#using (< 2) to (0) and >= 2 to (1) here based on HRS findings#
+dfM2ff$financial_control_M2 <- ifelse(dfM2ff$financial_control_M2 >= 2, 1, 0)
+
+table(dfM2ff$financial_control_M2)
+
+#family contact frequency#
+dfM2ff$family_contact_M2 <- ifelse(dfM2ff$family_contact_M2 >= 7, 1, 0)
+
+table(dfM2ff$family_contact_M2)
+
+#friend contact frequency#
+dfM2ff$friends_contact_M2 <-  ifelse(dfM2ff$friends_contact_M2 <= 2, 1, 
+                                              dfM2ff$friends_contact_M2 - 1)
+
+table(dfM2ff$friends_contact_M2)
+
+#volunteer#
+dfM2ff$volunteer_M2 <- ifelse(dfM2ff$volunteer_M2 == 0, 1, 0)
+
+table(dfM2ff$volunteer_M2)
+
+#feels isolated/loneliness#
+#recode#
+lonely0 <- c(1, 2, 3, 4, 5)
+lonely1 <- c(6, 7, 8, 9, 10)
+lonely2 <- c(11, 12, 13)
+
+dfM2ff$loneliness_M2 <- ifelse(dfM2ff$loneliness_M2 %in% lonely0, 0, 
+                                ifelse(dfM2ff$loneliness_M2 %in% lonely1, 1, 2))
+
+table(dfM2ff$loneliness_M2)
+
+#treated with less courtesy or respect than others#
+#recode#
+courtresp0 <- c(1, 2, 3, 4)
+courtresp1 <- c(5, 6, 7)
+
+dfM2ff$courtresp_M2 <- ifelse(dfM2ff$courtresp_M2 %in% courtresp0, 0, 1)
+
+table(dfM2ff$courtresp_M2)
+
+#inspect#
+view(dfM2ff)
+```
+
+
+# Functional forms
+
+```{r}
+#######################
+#var types#
+#######################
+continuousvars <- c("age_M2", "volunteer_M2")
+ordinalvars <- c("neighborhood_clean_M2", "financial_control_M2", "family_contact_M2", "friends_contact_M2",
+                 "loneliness_M2", "courtresp_M2")
+
+#######################
+#continuous#
+#######################
+
+########
+#age_M2#
+alin <- glm(mortality ~ age_M2, data = dfM2og, family = binomial, na.action = na.omit)
+
+dfM2og$logage_M2 <- log(dfM2og$age_M2 + 1)
+alog <- glm(mortality ~ logage_M2, data = dfM2og, family = binomial, na.action = na.omit)
+
+dfM2og$expage_M2 <- exp(dfM2og$age_M2)
+aexp <- glm(mortality ~ expage_M2, data = dfM2og, family = binomial, na.action = na.omit)
+
+abic <- data.frame(
+  Model = c("Linear", "Log", "Exp"),
+  BIC = c(BIC(alin), BIC(alog), BIC(aexp))
+)
+
+print(abic)
+
+
+########
+#volunteer_M2#
+vlin <- glm(mortality ~ volunteer_M2, data = dfM2og, family = binomial, na.action = na.omit)
+
+dfM2og$logvolunteer_M2 <- log(dfM2og$volunteer_M2 + 1)
+vlog <- glm(mortality ~ logvolunteer_M2, data = dfM2og, family = binomial, na.action = na.omit)
+
+dfM2og$expvolunteer_M2 <- exp(dfM2og$volunteer_M2)
+vexp <- glm(mortality ~ expvolunteer_M2, data = dfM2og, family = binomial, na.action = na.omit)
+
+vbic <- data.frame(
+  Model = c("Linear", "Log", "Exp"),
+  BIC = c(BIC(vlin), BIC(vlog), BIC(vexp))
+)
+
+print(vbic)
+
+#######################
+#ordinal#
+#######################
+
+########
+#neighborhood_clean_M2#
+nclin <- glm(mortality ~ neighborhood_clean_M2, data = dfM2og, family = binomial, na.action = na.omit)
+
+dfM2og[, "neighborhood_clean_M2"] <- as.factor(dfM2og[,"neighborhood_clean_M2"])
+nccat <- glm(mortality ~ neighborhood_clean_M2, data = dfM2og, family = binomial, na.action = na.omit)
+
+ncman <- glm(mortality ~ neighborhood_clean_M2, data = dfM2ff, family = binomial, na.action = na.omit)
+
+ncbic <- data.frame(
+  Model = c("Linear", "Categorical", "Binary"),
+  BIC = c(BIC(nclin), BIC(nccat), BIC(ncman))
+)
+
+print(ncbic)
+
+########
+#financial_control_M2# 
+fclin <- glm(mortality ~ financial_control_M2, data = dfM2og, family = binomial, na.action = na.omit)
+
+dfM2og[, "financial_control_M2"] <- as.factor(dfM2og[,"financial_control_M2"])
+fccat <- glm(mortality ~ financial_control_M2, data = dfM2og, family = binomial, na.action = na.omit)
+
+fcman <- glm(mortality ~ financial_control_M2, data = dfM2ff, family = binomial, na.action = na.omit)
+
+fcbic <- data.frame(
+  Model = c("Linear", "Categorical", "Binary"),
+  BIC = c(BIC(fclin), BIC(fccat), BIC(fcman))
+)
+
+print(fcbic)
+
+
+########
+#family_contact_M2# 
+facolin <- glm(mortality ~ family_contact_M2, data = dfM2og, family = binomial, na.action = na.omit)
+
+dfM2og[, "family_contact_M2"] <- as.factor(dfM2og[,"family_contact_M2"])
+facocat <- glm(mortality ~ family_contact_M2, data = dfM2og, family = binomial, na.action = na.omit)
+
+facoman <- glm(mortality ~ family_contact_M2, data = dfM2ff, family = binomial, na.action = na.omit)
+
+facobic <- data.frame(
+  Model = c("Linear", "Categorical", "Binary"),
+  BIC = c(BIC(facolin), BIC(facocat), BIC(facoman))
+)
+
+print(facobic)
+
+
+########
+#friends_contact_M2#
+frcolin <- glm(mortality ~ friends_contact_M2, data = dfM2og, family = binomial, na.action = na.omit)
+
+dfM2og[, "friends_contact_M2"] <- as.factor(dfM2og[,"friends_contact_M2"])
+frcocat <- glm(mortality ~ friends_contact_M2, data = dfM2og, family = binomial, na.action = na.omit)
+
+frcoman <- glm(mortality ~ friends_contact_M2, data = dfM2ff, family = binomial, na.action = na.omit)
+
+frcobic <- data.frame(
+  Model = c("Linear", "Categorical", "Binary"),
+  BIC = c(BIC(frcolin), BIC(frcocat), BIC(frcoman))
+)
+
+print(frcobic)
+
+
+########
+#loneliness_M2#
+lolin <- glm(mortality ~ loneliness_M2, data = dfM2og, family = binomial, na.action = na.omit)
+
+dfM2og[, "loneliness_M2"] <- as.factor(dfM2og[,"loneliness_M2"])
+locat <- glm(mortality ~ loneliness_M2, data = dfM2og, family = binomial, na.action = na.omit)
+
+loman <- glm(mortality ~ loneliness_M2, data = dfM2ff, family = binomial, na.action = na.omit)
+
+lobic <- data.frame(
+  Model = c("Linear", "Categorical", "Binary"),
+  BIC = c(BIC(lolin), BIC(locat), BIC(loman))
+)
+
+print(lobic)
+
+
+########
+#courtresp_M2#
+crlin <- glm(mortality ~ courtresp_M2, data = dfM2og, family = binomial, na.action = na.omit)
+
+dfM2og[, "courtresp_M2"] <- as.factor(dfM2og[,"courtresp_M2"])
+crcat <- glm(mortality ~ courtresp_M2, data = dfM2og, family = binomial, na.action = na.omit)
+
+crman <- glm(mortality ~ courtresp_M2, data = dfM2ff, family = binomial, na.action = na.omit)
+
+crbic <- data.frame(
+  Model = c("Linear", "Categorical", "Binary"),
+  BIC = c(BIC(crlin), BIC(crcat), BIC(crman))
+)
+
+print(crbic)
+
+summary <- cbind(abic$BIC, vbic$BIC, ncbic$BIC, fcbic$BIC, facobic$BIC, frcobic$BIC,
+                 lobic$BIC, crbic$BIC)
+colnames(summary) <- c("age", "volunteer", "neighborhood cleanliness", "financial control", 
+                       "family contact", "friends contact", "loneliness", "courtesy/respect")
+rownames(summary) <- c("1", "2", "3")
+summary <- as.data.frame(summary)
+summary
+
+write.csv(summary, file.path(outdir, "MIDUS functional forms.csv"), row.names = FALSE)
+```
+
+
+# Recode vars based on functional forms
+
+```{r}
+#######################
+#age (age_M2)#
+#######################
+#check#
+summary(dfM2$age_M2)
+
+#no change#
+
+#######################
+#sex (sex_M2)#
+#######################
+#check#
+table(dfM2$sex_M2)
+dfM2$sex_M2 <- as.numeric(dfM2$sex_M2)
+
+#no change#
+
+#######################
+#neighborhood clean?#
+#(neighborhood_clean_M2)#
+#######################
+#check#
+table(dfM2$neighborhood_clean_M2)
+
+#code (1, 2) = (0), (3, 4) = (1)#
+dfM2$neighborhood_clean_M2 <- ifelse(dfM2$neighborhood_clean_M2 == 1, 0, 
+                                ifelse(dfM2$neighborhood_clean_M2 == 2, 0, 1))
+
+
+#check#
+table(dfM2$neighborhood_clean_M2)
+
+#######################
+#financial control#
+#(financial_control_M2)#
+#######################
+#check#
+table(dfM2$financial_control_M2)
+
+#no change#
+
+#######################
+#family contact#
+#(family_contact_M2)#
+#######################
+#check#
+table(dfM2$family_contact_M2)
+
+#code (<7) = (0), (7, 8) = 1#
+dfM2$family_contact_M2 <- ifelse(dfM2$family_contact_M2 >= 7, 1, 0)
+
+#check#
+table(dfM2$family_contact_M2)
+
+#######################
+#friends contact#
+#(friends_contact_M2)#
+#######################
+#check#
+table(dfM2$friends_contact_M2)
+
+#compress bottom (1, 2) = 1, subtract 1 from else#
+dfM2$friends_contact_M2 <-  ifelse(dfM2$friends_contact_M2 <= 2, 1, 
+                                              dfM2$friends_contact_M2 - 1)
+
+#check#
+table(dfM2$friends_contact_M2)
+
+#######################
+#work for pay?#
+#(work_M2)#
+#######################
+#check#
+table(dfM2$work_M2)
+
+#no change#
+
+#######################
+#volunteer#
+#(volunteer_M2)#
+#######################
+#check#
+summary(dfM2$volunteer_M2)
+
+#change to log scale#
+dfM2$volunteer_M2 <- log(dfM2$volunteer_M2 + 1)
+
+#check#
+summary(dfM2$volunteer_M2)
+
+#######################
+#loneliness#
+#(loneliness_M2)#
+#######################
+#check#
+table(dfM2$loneliness_M2)
+
+#no change#
+
+#######################
+#treated w/ less courtesy/respect#
+#(courtresp_M2)#
+#######################
+#check#
+table(dfM2$courtresp_M2)
+
+#code (< 5) to (0); (>= 5) to (1)#
+courtresp0 <- c(1, 2, 3, 4)
+courtresp1 <- c(5, 6, 7)
+
+dfM2$courtresp_M2 <- ifelse(dfM2$courtresp_M2 %in% courtresp0, 0, 1)
+
+#check#
+table(dfM2$courtresp_M2)
+```
+
+
+# Developing models in M2
+
+### SFI-10
+
+```{r}
+#######################
+#rename cols to be congruent#
+#w HRS names#
+#######################
+colnames(dfM2)[c(5:11, 50:52)] <- c("sex", "age", "neighborhood", "financial_control", 
+                             "freq_children", "activities_youth", "work", "volunteering", 
+                             "feel_isolated", "courtresp")
+
+#######################
+#specifying models#
+#######################
+#SFI10#
+sfi <- glm(mortality ~ age + sex + neighborhood + financial_control + freq_children 
+           + activities_youth + work + volunteering + feel_isolated + courtresp, 
+           family = binomial, data = dfM2, na.action = na.omit)
+
+summary(sfi)
+
+dfM2$SFIlp_M2 <- predict(sfi, type = "link")
+dfM2$SFIpr_M2 <- predict(sfi, type = "response")
+
+#######################
+#distribution viz#
+#######################
+pdf(file.path(outdir, "M2SFI10distributions.pdf"), width = 6, height = 5)
+hist(dfM2$SFIlp_M2, breaks = "sturges", freq = FALSE, 
+     xlim = c(-8, 2), ylim = c(0, 0.35), 
+     main = "M2 Cohort: SFI-10", xlab = "Mortality Risk (Log Probability)")
+lines(density(dfM2$SFIlp_M2), col = "#27933E")
+hist(dfM2$SFIpr_M2, breaks = "sturges", freq = FALSE, 
+     xlim = c(0, 1), ylim = c(0, 25), 
+     main = "M2 Cohort: SFI-10", xlab = "Mortality Risk (Probability)")
+lines(density(dfM2$SFIpr_M2), col = "#27933E")
+dev.off()
+```
+
+### Age
+
+```{r}
+#######################
+#specifying models#
+#######################
+glmage <- glm(mortality ~ age, family = binomial, data = dfM2, na.action = na.omit)
+summary(glmage)
+
+dfM2$agelp <- predict(glmage, type = "link")
+dfM2$agepr <- predict(glmage, type = "response")
+
+#######################
+#distribution viz#
+#######################
+pdf(file.path(outdir, "M2glmagedistributions.pdf"), width = 6, height = 5)
+hist(dfM2$agelp, breaks = "sturges", freq = FALSE, 
+     xlim = c(-6, -1), ylim = c(0, 0.5), 
+     main = "M2 Cohort: Age", xlab = "Mortality Risk (Log Probability)")
+lines(density(dfM2$agelp), col = "#27933E")
+hist(dfM2$agepr, breaks = "sturges", freq = FALSE, 
+     xlim = c(0, 1), ylim = c(0, 25), 
+     main = "M2 Cohort: Age", xlab = "Mortality Risk (Probability)")
+lines(density(dfM2$agepr), col = "#27933E")
+dev.off()
+```
+
+### Age & Sex
+
+```{r}
+#######################
+#specifying models#
+#######################
+sexage <- glm(mortality ~ age + sex, family = binomial, data = dfM2, na.action = na.omit)
+summary(sexage)
+
+dfM2$sexagelp <- predict(sexage, type = "link")
+dfM2$sexagepr <- predict(sexage, type = "response")
+
+#######################
+#distribution viz#
+#######################
+pdf(file.path(outdir, "M2glmagesexdistributions.pdf"), width = 6, height = 5)
+hist(dfM2$sexagelp, breaks = "sturges", freq = FALSE, 
+     xlim = c(-6, -1), ylim = c(0, 0.4), 
+     main = "M2 Cohort: Age & Sex", xlab = "Mortality Risk (Log Probability)")
+lines(density(dfM2$sexagelp), col = "#27933E")
+hist(dfM2$sexagepr, breaks = "sturges", freq = FALSE, 
+     xlim = c(0, 1), ylim = c(0, 30), 
+     main = "M2 Cohort: Age & Sex", xlab = "Mortality Risk (Probability)")
+lines(density(dfM2$sexagepr), col = "#27933E")
+dev.off()
+```
+
+### SFI-8
+
+```{r}
+#######################
+#specifying models#
+#######################
+sfisoc <- glm(mortality ~ neighborhood + financial_control + freq_children 
+           + activities_youth + work + volunteering + feel_isolated + courtresp, 
+           family = binomial, data = dfM2, na.action = na.omit)
+
+summary(sfisoc)
+
+dfM2$socSFIlp <- predict(sfisoc, type = "link")
+dfM2$socSFIpr <- predict(sfisoc, type = "response")
+
+#######################
+#distribution viz#
+#######################
+pdf(file.path(outdir, "M2SFI8distributions.pdf"), width = 6, height = 5)
+hist(dfM2$socSFIlp, breaks = "sturges", freq = FALSE, 
+     xlim = c(-6, -1), ylim = c(0, 1), 
+     main = "M2 Cohort: SFI-8", xlab = "Mortality Risk (Log Probability)")
+lines(density(dfM2$socSFIlp), col = "#27933E")
+hist(dfM2$socSFIpr, breaks = "sturges", freq = FALSE, 
+     xlim = c(0, 1), ylim = c(0, 40), 
+     main = "M2 Cohort: SFI-8", xlab = "Mortality Risk (Probability)")
+lines(density(dfM2$socSFIpr), col = "#27933E")
+dev.off()
+```
+
+### AIC/BIC
+
+```{r}
+#all models specified in R#
+midusglmsBIC <- BIC(glmage, sexage, sfisoc, sfi)
+midusglmsAIC <- AIC(glmage, sexage, sfisoc, sfi)
+
+midusglmmodelfit <- cbind(midusglmsBIC, midusglmsAIC$AIC)
+
+print(midusglmmodelfit)
+
+write.csv(midusglmmodelfit, file.path(outdir, "M2ModelFit.csv"), row.names = TRUE)
+```
+
+### BCa bootstrap fucntions
+
+```{r}
+stratboot <- function(data, statistic, R = 9999, strata, conf.level = 0.95, ...) {
+  levels <- unique(strata)
+  n <- nrow(data)
+
+  resamples <- replicate(R, {
+    unlist(lapply(levels, function(lvl) {
+      idx <- which(strata == lvl)
+      sample(idx, length(idx), replace = TRUE)
+    }))
+  }, simplify = FALSE)
+
+  statwrap <- function(data, indices) statistic(data[indices, ], ...)
+
+  bootobj <- boot(data = data, statistic = statwrap, R = R, sim = "ordinary")
+  bootobj$t <- sapply(resamples, function(i) statwrap(data, i))
+  bootobj$t <- matrix(bootobj$t, ncol = 1)
+
+  ci <- boot.ci(bootobj, type = "bca", conf = conf.level)
+
+  list(
+    estimate = statwrap(data, 1:n),
+    bca_ci = ci$bca[4:5],
+    bootobj = bootobj
+  )
+}
+
+auroc <- function(data) {
+  pROC::auc(pROC::roc(data$response, data$predicted, quiet = TRUE)) |> as.numeric()
+}
+
+auprc <- function(data) {
+  PRROC::pr.curve(
+    scores.class0 = data$predicted[data$response == 1],
+    scores.class1 = data$predicted[data$response == 0],
+    curve = FALSE)$auc.integral
+}
+
+aurocdiff <- function(data) {
+  auc1 <- pROC::auc(pROC::roc(data$response, data$pred1, quiet = TRUE)) |> as.numeric()
+  auc2 <- pROC::auc(pROC::roc(data$response, data$pred2, quiet = TRUE)) |> as.numeric()
+  auc1 - auc2
+}
+
+auprcdiff <- function(data) {
+  pr1 <- PRROC::pr.curve(scores.class0 = data$pred1[data$response == 1],
+                         scores.class1 = data$pred1[data$response == 0],
+                         curve = FALSE)$auc.integral
+  pr2 <- PRROC::pr.curve(scores.class0 = data$pred2[data$response == 1],
+                         scores.class1 = data$pred2[data$response == 0],
+                         curve = FALSE)$auc.integral
+  pr1 - pr2
+}
+```
+
+### M2 AUCs
+
+```{r}
+#######################
+#SFI-10#
+#######################
+set.seed(555)
+roccurvesfiM2 <- roc(dfM2$mortality, dfM2$SFIpr_M2, auc = TRUE, 
+                     ci = TRUE, of = "auc", ci.method = "bootstrap", 
+                     conf.level = 0.95, boot.n = 9999, boot.stratified = TRUE)
+aucsfiM2 <- roccurvesfiM2$auc
+ciaucsfiM2 <-  roccurvesfiM2$ci
+print(aucsfiM2)
+print(ciaucsfiM2)
+
+dfbcarocsfiM2 <- data.frame(response = dfM2$mortality, 
+                            predicted = dfM2$SFIpr_M2)
+bcaciaucsfiM2 <- stratboot(dfbcarocsfiM2, auroc, R = 9999, strata = dfbcarocsfiM2$response)
+print(bcaciaucsfiM2)
+
+dfrocsfiM2 <- data.frame(specificity = 1 - roccurvesfiM2$specificities, 
+                         sensitivity = roccurvesfiM2$sensitivities)
+
+pdf(file.path(outdir, "M2AUCROC.pdf"), width = 5, height = 5)
+ggplot(dfrocsfiM2, aes(x = specificity, y = sensitivity)) + 
+  geom_line(color = "#27933E", size = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = 5, color = "#5F6062") +
+    labs(title = paste0("M2 SFI-10: Mortality (AUC = ", round(aucsfiM2, 3), ")"), 
+         x = "1 - Specificity", y = "Sensitivity") + 
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+dev.off()
+
+prcurvesfiM2 <- pr.curve(scores.class0 = dfM2$SFIpr_M2, weights.class0 = dfM2$mortality, curve = TRUE)
+auprcsfiM2 <- prcurvesfiM2$auc.integral
+print(auprcsfiM2)
+
+dfbcaprcsfiM2 <- data.frame(response = dfM2$mortality, 
+                            predicted = dfM2$SFIpr_M2)
+bcaciauprcsfiM2 <- stratboot(dfbcarocsfiM2, auprc, R = 9999, strata = dfbcaprcsfiM2$response)
+print(bcaciauprcsfiM2)
+
+dfprcsfiM2 <- data.frame(recall = prcurvesfiM2$curve[, 1], 
+                         precision = prcurvesfiM2$curve[, 2])
+
+pdf(file.path("M2AUCPRC.pdf"), width = 5, height = 5)
+blineM2 <- (sum(dfM2$mortality == TRUE)) / length(dfM2$mortality)
+blineM2
+  
+ggplot(dfprcsfiM2, aes(x = recall, y = precision)) +
+  geom_line(color = "#27933E", size = 1) +
+   geom_abline(intercept = blineM2, slope = 0, linetype = 5, color = "#5F6062") +
+  labs(title = paste0("M2 SFI-10: Mortality (AUC = ", sprintf("%.3f", auprcsfiM2), ")"),
+    x = "Sensitivity", y = "PPV") +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+plot(prcurvesfiM2)
+dev.off()
+```
+
+
+# Testing models in R1
+
+### Recode vars based on functional forms
+
+```{r}
+#######################
+#age (age_R1)#
+#######################
+#check#
+summary(dfR1$age_R1)
+
+#no change#
+
+#######################
+#sex (sex_R1)#
+#######################
+#check#
+table(dfR1$sex_R1)
+
+dfR1$sex_R1 <- as.numeric(dfR1$sex_R1)
+
+#no change#
+
+#######################
+#neighborhood clean?#
+#(neighborhood_clean_R1)#
+#######################
+#check#
+table(dfR1$neighborhood_clean_R1)
+
+#code (1, 2) = (0), (3, 4) = (1)#
+dfR1$neighborhood_clean_R1 <- ifelse(dfR1$neighborhood_clean_R1 == 1, 0, 
+                                ifelse(dfR1$neighborhood_clean_R1 == 2, 0, 1))
+
+#check#
+table(dfR1$neighborhood_clean_R1)
+
+#######################
+#financial control#
+#(financial_control_R1)#
+#######################
+#check#
+table(dfR1$financial_control_R1)
+
+#no change#
+
+#######################
+#family contact#
+#(family_contact_R1)#
+#######################
+#check#
+table(dfR1$family_contact_R1)
+
+#code (<=7) to (0); (8) to (1)#
+dfR1$family_contact_R1 <- ifelse(dfR1$family_contact_R1 == 8, 1, 0)
+
+#check#
+table(dfR1$family_contact_R1)
+
+#######################
+#friends contact#
+#(friends_contact_R1)#
+#######################
+#check#
+table(dfR1$friends_contact_R1)
+
+#compress bottom (1, 2) = 1, subtract 1 from else#
+dfR1$friends_contact_R1 <-  ifelse(dfR1$friends_contact_R1 <= 2, 1, 
+                                              dfR1$friends_contact_R1 - 1)
+
+#check#
+table(dfR1$friends_contact_R1)
+
+#######################
+#work for pay?#
+#(work_R1)#
+#######################
+#check#
+table(dfR1$work_R1)
+
+#no change#
+
+#######################
+#volunteer#
+#(volunteer_R1)#
+#######################
+#check#
+summary(dfR1$volunteer_R1)
+
+#change to log scale#
+dfR1$volunteer_R1 <- log(dfR1$volunteer_R1 + 1)
+
+#check#
+summary(dfR1$volunteer_R1)
+
+#######################
+#loneliness#
+#(loneliness_R1)#
+#######################
+#check#
+table(dfR1$loneliness_R1)
+
+#no change#
+
+#######################
+#treated w/ less courtesy/respect#
+#(courtresp_R1)#
+#######################
+#check#
+table(dfR1$courtresp_R1)
+
+#code (< 5) to (0); (>= 5) to (1)#
+courtresp0 <- c(1, 2, 3, 4)
+courtresp1 <- c(5, 6, 7)
+
+dfR1$courtresp_R1 <- ifelse(dfR1$courtresp_R1 %in% courtresp0, 0, 1)
+
+#check#
+table(dfR1$courtresp_R1)
+```
+
+### Apply models
+
+```{r}
+#######################
+#rename cols to be congruent#
+#w HRS names#
+#######################
+colnames(dfR1)[c(5:11, 50:52)] <- c("sex", "age", "neighborhood", "financial_control", 
+                             "freq_children", "activities_youth", "work", "volunteering", 
+                             "feel_isolated", "courtresp")
+```
+
+### SFI10
+
+```{r}
+#######################
+#specifying models#
+#######################
+dfR1$SFIlp <- predict(sfi, newdata = dfR1, type = "link")
+dfR1$SFIpr <- predict(sfi, newdata = dfR1, type = "response")
+
+
+#######################
+#distribution viz#
+#######################
+pdf(file.path(outdir, "R1SFI10distributions.pdf"), width = 6, height = 5)
+hist(dfR1$SFIlp, breaks = "sturges", freq = FALSE, 
+     xlim = c(-8, 2), ylim = c(0, 0.3), 
+     main = "R1 Cohort: SFI-10", xlab = "Mortality Risk (Log Probability)")
+lines(density(dfR1$SFIlp), col = "#27933E")
+hist(dfR1$SFIpr, breaks = "sturges", freq = FALSE, 
+     xlim = c(0, 1), ylim = c(0, 16), 
+     main = "R1 Cohort: SFI-10", xlab = "Mortality Risk (Probability)")
+lines(density(dfR1$SFIpr), col = "#27933E")
+dev.off()
+```
+
+### ageglm
+
+```{r}
+#######################
+#specifying models#
+#######################
+dfR1$agelp <- predict(glmage, newdata = dfR1, type = "link")
+dfR1$agepr <- predict(glmage, newdata = dfR1, type = "response")
+
+#######################
+#distribution viz#
+#######################
+pdf(file.path(outdir, "R1AGEdistributions.pdf"), width = 6, height = 5)
+hist(dfR1$agelp, breaks = "sturges", freq = FALSE, 
+     xlim = c(-6, -1), ylim = c(0, 0.4), 
+     main = "R1 Cohort: Age", xlab = "Mortality Risk (Log Probability)")
+lines(density(dfR1$agelp), col = "#27933E")
+hist(dfR1$agepr, breaks = "sturges", freq = FALSE, 
+     xlim = c(0, 1), ylim = c(0, 20), 
+     main = "R1 Cohort: Age", xlab = "Mortality Risk (Probability)")
+lines(density(dfR1$agepr), col = "#27933E")
+dev.off()
+```
+
+### age & sex
+
+```{r}
+#######################
+#specifying models#
+#######################
+dfR1$sexagelp <- predict(sexage, newdata = dfR1, type = "link")
+dfR1$sexagepr <- predict(sexage, newdata = dfR1, type = "response")
+
+#######################
+#distribution viz#
+#######################
+pdf(file.path(outdir, "R1agesexdistributions.pdf"), width = 6, height = 5)
+hist(dfR1$sexagelp, breaks = "sturges", freq = FALSE, 
+     xlim = c(-6, -1), ylim = c(0, 0.4), 
+     main = "R1 Cohort: Age & Sex", xlab = "Mortality Risk (Log Probability)")
+lines(density(dfR1$sexagelp), col = "#27933E")
+hist(dfR1$sexagepr, breaks = "sturges", freq = FALSE, 
+     xlim = c(0, 1), ylim = c(0, 25), 
+     main = "R1 Cohort: Age & Sex", xlab = "Mortality Risk (Probability)")
+lines(density(dfR1$sexagepr), col = "#27933E")
+dev.off()
+```
+
+### SFI8
+
+```{r}
+#######################
+#specifying models#
+#######################
+dfR1$socSFIlp <- predict(sfisoc, newdata = dfR1, type = "link")
+dfR1$socSFIpr <- predict(sfisoc, newdata = dfR1, type = "response")
+
+#######################
+#distribution viz#
+#######################
+pdf(file.path(outdir, "R1SFI8distributions.pdf"), width = 6, height = 5)
+hist(dfR1$socSFIlp, breaks = "sturges", freq = FALSE, 
+     xlim = c(-6, -1), ylim = c(0, 0.8), 
+     main = "R1 Cohort: SFI-8", xlab = "Mortality Risk (Log Probability)")
+lines(density(dfR1$socSFIlp), col = "#27933E")
+hist(dfR1$socSFIpr, breaks = "sturges", freq = FALSE, 
+     xlim = c(0, 1), ylim = c(0, 25), 
+     main = "R1 Cohort: SFI-8", xlab = "Mortality Risk (Probability)")
+lines(density(dfR1$socSFIpr), col = "#27933E")
+dev.off()
+```
+
+### R1 AUC - ROC
+
+```{r}
+#######################
+#SFI-10#
+#######################
+set.seed(555)
+roccurvesfiR1 <- roc(dfR1$mortality, dfR1$SFIpr, auc = TRUE, 
+                     ci = TRUE, of = "auc", ci.method = "bootstrap", 
+                     conf.level = 0.95, boot.n = 9999, boot.stratified = TRUE)
+aucsfiR1 <- roccurvesfiR1$auc
+ciaucsfiR1 <-  roccurvesfiR1$ci
+print(aucsfiR1)
+print(ciaucsfiR1)
+
+dfbcarocsfiR1 <- data.frame(response = dfR1$mortality, 
+                            predicted = dfR1$SFIpr)
+bcaciaucsfiR1 <- stratboot(dfbcarocsfiR1, auroc, R = 9999, strata = dfbcarocsfiR1$response)
+print(bcaciaucsfiR1)
+
+dfrocsfiR1 <- data.frame(specificity = 1 - roccurvesfiR1$specificities, 
+                    sensitivity = roccurvesfiR1$sensitivities)
+
+
+pdf(file.path(outdir, "R1AUCROCs.pdf"), width = 4, height = 4)
+ggplot(dfrocsfiR1, aes(x = specificity, y = sensitivity)) + 
+  geom_line(color = "#27933E", size = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = 5, color = "#5F6062") +
+    labs(title = paste0("SFI-10: Mortality (AUC = ", sprintf("%.3f",aucsfiR1), ")"), 
+         x = "1 - Specificity", y = "Sensitivity") + 
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+
+#######################
+#age#
+#######################
+roccurveageR1 <- roc(dfR1$mortality, dfR1$agepr, auc = TRUE, 
+                     ci = TRUE, of = "auc", ci.method = "bootstrap", 
+                     conf.level = 0.95, boot.n = 9999, boot.stratified = TRUE)
+aucageR1 <- roccurveageR1$auc
+ciaucageR1 <-  roccurveageR1$ci
+print(aucageR1)
+print(ciaucageR1)
+
+dfbcarocageR1 <- data.frame(response = dfR1$mortality, 
+                            predicted = dfR1$agepr)
+bcaciaucageR1 <- stratboot(dfbcarocageR1, auroc, R = 9999, strata = dfbcarocageR1$response)
+print(bcaciaucageR1)
+
+dfrocageR1 <- data.frame(specificity = 1 - roccurveageR1$specificities, 
+                    sensitivity = roccurveageR1$sensitivities)
+
+ggplot(dfrocageR1, aes(x = specificity, y = sensitivity)) + 
+  geom_line(color = "#27933E", size = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = 5, color = "#5F6062") +
+    labs(title = paste0("Age: Mortality (AUC = ", sprintf("%.3f",aucageR1), ")"), 
+         x = "1 - Specificity", y = "Sensitivity") + 
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+
+#######################
+#age & sex#
+#######################
+roccurvesexageR1 <- roc(dfR1$mortality, dfR1$sexagepr, auc = TRUE, 
+                     ci = TRUE, of = "auc", ci.method = "bootstrap", 
+                     conf.level = 0.95, boot.n = 9999, boot.stratified = TRUE)
+aucsexageR1 <- roccurvesexageR1$auc
+ciaucsexageR1 <-  roccurvesexageR1$ci
+print(aucsexageR1)
+print(ciaucsexageR1)
+
+dfbcarocsexageR1 <- data.frame(response = dfR1$mortality, 
+                               predicted = dfR1$sexagepr)
+bcaciaucsexageR1 <- stratboot(dfbcarocsexageR1, auroc, R = 9999, strata = dfbcarocsexageR1$response)
+print(bcaciaucsexageR1)
+
+dfrocsexageR1 <- data.frame(specificity = 1 - roccurvesexageR1$specificities, 
+                    sensitivity = roccurvesexageR1$sensitivities)
+
+ggplot(dfrocsexageR1, aes(x = specificity, y = sensitivity)) + 
+  geom_line(color = "#27933E", size = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = 5, color = "#5F6062") +
+    labs(title = paste0("Age & Sex: Mortality (AUC = ", sprintf("%.3f",aucsexageR1), ")"), 
+         x = "1 - Specificity", y = "Sensitivity") + 
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+
+#######################
+#SFI-8#
+#######################
+roccurvesfisocR1 <- roc(dfR1$mortality, dfR1$socSFIpr, auc = TRUE, 
+                     ci = TRUE, of = "auc", ci.method = "bootstrap", 
+                     conf.level = 0.95, boot.n = 9999, boot.stratified = TRUE)
+aucsfisocR1 <- roccurvesfisocR1$auc
+ciaucsfisocR1 <-  roccurvesfisocR1$ci
+print(aucsfisocR1)
+print(ciaucsfisocR1)
+
+dfbcarocsfisocR1 <- data.frame(response = dfR1$mortality, 
+                               predicted = dfR1$socSFIpr)
+bcaciaucsfisocR1 <- stratboot(dfbcarocsfisocR1, auroc, R = 9999, strata = dfbcarocsfisocR1$response)
+print(bcaciaucsfisocR1)
+
+dfrocsfisocR1 <- data.frame(specificity = 1 - roccurvesfisocR1$specificities, 
+                    sensitivity = roccurvesfisocR1$sensitivities)
+
+ggplot(dfrocsfisocR1, aes(x = specificity, y = sensitivity)) + 
+  geom_line(color = "#27933E", size = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = 5, color = "#5F6062") +
+    labs(title = paste0("SFI-8: Mortality (AUC = ", sprintf("%.3f",aucsfisocR1), ")"), 
+         x = "1 - Specificity", y = "Sensitivity") + 
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+
+
+#######################
+#combined plot#
+#######################
+dfrocsfiR1$model <- paste0("SFI-10 (", sprintf("%.3f", aucsfiR1), ")")
+dfrocageR1$model <- paste0("Age (", sprintf("%.3f", aucageR1), ")")
+dfrocsexageR1$model <- paste0("Age & Sex (", sprintf("%.3f", aucsexageR1), ")")
+dfrocsfisocR1$model <- paste0("SFI-8 (", sprintf("%.3f", aucsfisocR1), ")")
+
+dfrocsR1 <- rbind(dfrocsfiR1, dfrocageR1, dfrocsexageR1, dfrocsfisocR1)
+
+dfrocsR1$model <- factor(dfrocsR1$model, levels = c(
+  paste0("SFI-10 (", sprintf("%.3f", aucsfiR1), ")"),
+  paste0("Age & Sex (", sprintf("%.3f", aucsexageR1), ")"),
+  paste0("Age (", sprintf("%.3f", aucageR1), ")"),
+  paste0("SFI-8 (", sprintf("%.3f", aucsfisocR1), ")")))
+
+modcols <- setNames(c("#27933E", "#B8CDF8", "#6A4C93", "#E4CC37"),
+                    c(paste0("SFI-10 (", sprintf("%.3f", aucsfiR1), ")"),
+                      paste0("Age (", sprintf("%.3f", aucageR1), ")"),
+                      paste0("Age & Sex (", sprintf("%.3f", aucsexageR1), ")"),
+                      paste0("SFI-8 (", sprintf("%.3f", aucsfisocR1), ")")))
+
+
+ggplot(dfrocsR1, aes(x = specificity, y = sensitivity, color = model)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = modcols) +
+  geom_abline(intercept = 0, slope = 1, linetype = 5, color = "#5F6062") +
+  labs(title = "Figure 2A with legend",
+       x = "1 - Specificity", y = "Sensitivity", color = expression("Model (AU"[ROC]*")")) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 11),
+    axis.text = element_text(size = 11), legend.title = element_text(size = 11),
+    legend.text = element_text(size = 11), 
+    legend.position = "right")
+
+ggplot(dfrocsR1, aes(x = specificity, y = sensitivity, color = model)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = modcols) +
+  geom_abline(intercept = 0, slope = 1, linetype = 5, color = "#5F6062") +
+  labs(title = "Figure 2A",
+       x = "1 - Specificity", y = "Sensitivity", color = expression("Model (AU"[ROC]*")")) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 11),
+    axis.text = element_text(size = 11), legend.title = element_text(size = 11),
+    legend.text = element_text(size = 11), 
+    legend.position = "none")
+
+dev.off()
+
+#######################
+#testing#
+#######################
+#BCa CI-based bootstrap test: SexAge vs. SFI-10#
+dfdiffsexage <- data.frame(response = dfR1$mortality,
+                           pred1 = dfR1$SFIpr,
+                           pred2 = dfR1$sexagepr)
+
+sfisexagediff <- stratboot(dfdiffsexage, aurocdiff, R = 9999, strata = dfdiffsexage$response, conf.level = 0.90)
+print(sfisexagediff)
+
+#BCa CI-based bootstrap test: SFI-8 vs. SFI-10#
+dfdiffsfisoc <- data.frame(response = dfR1$mortality,
+                           pred1 = dfR1$SFIpr,
+                           pred2 = dfR1$socSFIpr)
+
+sfisocdiff <- stratboot(dfdiffsfisoc, aurocdiff, R = 9999, strata = dfdiffsfisoc$response, conf.level = 0.90)
+print(sfisocdiff)
+```
+
+### R1 AUC - PRC
+
+```{r}
+#######################
+#baseline#
+#######################
+blineR1 <- (sum(dfR1$mortality == TRUE)) / length(dfR1$mortality)
+blineR1
+
+#######################
+#SFI-10#
+#######################
+set.seed(555)
+prcurvesfiR1 <- pr.curve(scores.class0 = dfR1$SFIpr, weights.class0 = dfR1$mortality, curve = TRUE)
+auprcsfiR1 <- prcurvesfiR1$auc.integral
+print(auprcsfiR1)
+
+dfbcaprcsfiR1 <- data.frame(response = dfR1$mortality, 
+                            predicted = dfR1$SFIpr)
+bcaciauprcsfiR1 <- stratboot(dfbcarocsfiR1, auprc, R = 9999, strata = dfbcaprcsfiR1$response)
+print(bcaciauprcsfiR1)
+
+
+dfprcsfiR1 <- data.frame(recall = prcurvesfiR1$curve[, 1], 
+                         precision = prcurvesfiR1$curve[, 2])
+
+pdf(file.path(outdir, "R1AUCPRCs.pdf"), width = 4, height = 4)
+ggplot(dfprcsfiR1, aes(x = recall, y = precision)) +
+  geom_line(color = "#27933E", size = 1) +
+  geom_abline(intercept = blineR1, slope = 0, linetype = 5, color = "#5F6062") +
+  labs(title = paste0("SFI-10: Mortality (AUC = ", sprintf("%.3f", auprcsfiR1), ")"),
+    x = "Sensitivity", y = "PPV") +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+
+plot(prcurvesfiR1)
+
+#######################
+#age#
+#######################
+prcurveageR1 <- pr.curve(scores.class0 = dfR1$agepr, weights.class0 = dfR1$mortality, curve = TRUE)
+auprcageR1 <- prcurveageR1$auc.integral
+print(auprcageR1)
+
+dfbcaprcageR1 <- data.frame(response = dfR1$mortality, 
+                            predicted = dfR1$agepr)
+bcaciauprcageR1 <- stratboot(dfbcarocageR1, auprc, R = 9999, strata = dfbcaprcageR1$response)
+print(bcaciauprcageR1)
+
+dfprcageR1 <- data.frame(recall = prcurveageR1$curve[, 1], 
+                         precision = prcurveageR1$curve[, 2])
+
+ggplot(dfprcageR1, aes(x = recall, y = precision)) +
+  geom_line(color = "#27933E", size = 1) +
+  geom_abline(intercept = blineR1, slope = 0, linetype = 5, color = "#5F6062") +
+  labs(title = paste0("Age: Mortality (AUC = ", sprintf("%.3f", auprcageR1), ")"),
+    x = "Sensitivity", y = "PPV") +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+
+plot(prcurveageR1)
+
+#######################
+#age & sex#
+#######################
+prcurvesexageR1 <- pr.curve(scores.class0 = dfR1$sexagepr, weights.class0 = dfR1$mortality, curve = TRUE)
+auprcsexageR1 <- prcurvesexageR1$auc.integral
+print(auprcsexageR1)
+
+dfbcaprcsexageR1 <- data.frame(response = dfR1$mortality, 
+                               predicted = dfR1$sexagepr)
+bcaciauprcsexageR1 <- stratboot(dfbcarocsexageR1, auprc, R = 9999, strata = dfbcaprcsexageR1$response)
+print(bcaciauprcsexageR1)
+
+dfprcsexageR1 <- data.frame(recall = prcurvesexageR1$curve[, 1], 
+                         precision = prcurvesexageR1$curve[, 2])
+
+ggplot(dfprcsexageR1, aes(x = recall, y = precision)) +
+  geom_line(color = "#27933E", size = 1) +
+  geom_abline(intercept = blineR1, slope = 0, linetype = 5, color = "#5F6062") +
+  labs(title = paste0("Age & Sex: Mortality (AUC = ", sprintf("%.3f", auprcsexageR1), ")"),
+    x = "Sensitivity", y = "PPV") +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+
+plot(prcurvesexageR1)
+
+#######################
+#SFI-8#
+#######################
+prcurvesocsfiR1 <- pr.curve(scores.class0 = dfR1$socSFIpr, weights.class0 = dfR1$mortality, curve = TRUE)
+auprcsocsfiR1 <- prcurvesocsfiR1$auc.integral
+print(auprcsocsfiR1)
+
+dfbcaprcsocsfiR1 <- data.frame(response = dfR1$mortality, 
+                               predicted = dfR1$socSFIpr)
+bcaciauprcsocsfiR1 <- stratboot(dfbcaprcsocsfiR1, auprc, R = 9999, strata = dfbcaprcsocsfiR1$response)
+print(bcaciauprcsocsfiR1)
+
+dfprcsocsfiR1 <- data.frame(recall = prcurvesocsfiR1$curve[, 1], 
+                         precision = prcurvesocsfiR1$curve[, 2])
+
+ggplot(dfprcsocsfiR1, aes(x = recall, y = precision)) +
+  geom_line(color = "#27933E", size = 1) +
+  geom_abline(intercept = blineR1, slope = 0, linetype = 5, color = "#5F6062") +
+  labs(title = paste0("SFI-8: Mortality (AUC = ", sprintf("%.3f", auprcsocsfiR1), ")"),
+    x = "Sensitivity", y = "PPV") +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+
+plot(prcurvesocsfiR1)
+
+#######################
+#combined plot#
+#######################
+dfprcsfiR1$model <- paste0("SFI-10 (", sprintf("%.3f", auprcsfiR1), ")")
+dfprcageR1$model <- paste0("Age (", sprintf("%.3f", auprcageR1), ")")
+dfprcsexageR1$model <- paste0("Age & Sex (", sprintf("%.3f", auprcsexageR1), ")")
+dfprcsocsfiR1$model <- paste0("SFI-8 (", sprintf("%.3f", auprcsocsfiR1), ")")
+
+dfprcsR1 <- rbind(dfprcsfiR1, dfprcageR1, dfprcsexageR1, dfprcsocsfiR1)
+
+dfprcsR1$model <- factor(dfprcsR1$model, levels = c(
+  paste0("SFI-10 (", sprintf("%.3f", auprcsfiR1), ")"),
+  paste0("Age & Sex (", sprintf("%.3f", auprcsexageR1), ")"),
+  paste0("Age (", sprintf("%.3f", auprcageR1), ")"),
+  paste0("SFI-8 (", sprintf("%.3f", auprcsocsfiR1), ")")))
+
+modcols <- setNames(c("#27933E", "#B8CDF8", "#6A4C93", "#E4CC37"),
+                    c(paste0("SFI-10 (", sprintf("%.3f", auprcsfiR1), ")"),
+                      paste0("Age (", sprintf("%.3f", auprcageR1), ")"),
+                      paste0("Age & Sex (", sprintf("%.3f", auprcsexageR1), ")"),
+                      paste0("SFI-8 (", sprintf("%.3f", auprcsocsfiR1), ")")))
+
+
+ggplot(dfprcsR1, aes(x = recall, y = precision, color = model)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = modcols) +
+  geom_abline(intercept = blineR1, slope = 0, linetype = 5, color = "#5F6062") +
+  labs(title = "Supplemental Figure 2A with legend",
+       x = "Sensitivity", y = "PPV", color = expression("Model (AU"[PRC]*")")) +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 9),
+    axis.text = element_text(size = 9), legend.title = element_text(size = 9),
+    legend.text = element_text(size = 9), 
+    legend.position = "right")
+
+ggplot(dfprcsR1, aes(x = recall, y = precision, color = model)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = modcols) +
+  geom_abline(intercept = blineR1, slope = 0, linetype = 5, color = "#5F6062") +
+  labs(title = "Supplemental Figure 2A",
+       x = "Sensitivity", y = "PPV", color = expression("Model (AU"[PRC]*")")) +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 9),
+    axis.text = element_text(size = 9), legend.title = element_text(size = 9),
+    legend.text = element_text(size = 9), 
+    legend.position = "none")
+
+dev.off()
+
+#######################
+#testing#
+#######################
+#BCa CI-based bootstrap test: SexAge vs. SFI-10#
+sfisexageprcdiff <- stratboot(dfdiffsexage, auprcdiff, R = 9999, strata = dfdiffsexage$response, conf.level = 0.90)
+print(sfisexageprcdiff)
+```
+
+
+# Feature importance functions
+
+```{r}
+aurocloss <- function(response, predicted) {
+  rocobj <- roc(response, predicted)
+  return(1 - rocobj$auc)
+}
+
+auprcloss <- function(response, predicted) {
+  pc <- predicted[response == 1]
+  nc <- predicted[response == 0]
+  prcobj <- pr.curve(scores.class0 = pc, scores.class1 = nc)
+  return(1 - prcobj$auc.integral)
+}
+```
+
+
+# R1 Feature importance - ROC
+
+```{r}
+#######################
+#SFI-10#
+#######################
+set.seed(555)
+sfipredR1 <- Predictor$new(model = sfi, data = dfR1[, c(5:11, 50:52)], y = dfR1$mortality)
+
+sfiimpR1 <- FeatureImp$new(sfipredR1, loss = aurocloss, compare = "difference", n.repetitions = 1000)
+
+sfiimpplotR1 <- plot(sfiimpR1)
+
+dfR1labs <- c(age = "Age", sex = "Sex", neighborhood = "Neighborhood clean", 
+              financial_control = "Financial control", freq_children = "Family contact",
+              activities_youth = "Friend contact", work = "Working", volunteering = "Volunteering", 
+              feel_isolated = "Loneliness", courtresp = "Courtesy/respect")
+
+pdf(file.path(outdir, "R1FeatureImpsROC.pdf"), width = 5.1, height = 4)
+sfiimpplotR1 +
+  ggtitle("Figure 2B") +
+  scale_x_continuous(name = expression("Feature Importance (Loss: 1 - AU"[ROC]*")"), 
+                     breaks = c(0.00, 0.05, 0.10, 0.15, 0.20), 
+                     limits = c(-0.02, 0.20)) +
+  scale_y_discrete(name = NULL, labels = dfR1labs) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13.5),      
+    axis.text = element_text(size = 13.5))
+
+sfiimpR1res <- sfiimpR1$results
+sfiimpR1res
+write.csv(sfiimpR1res, file.path(outdir, "MIDUS R1 SFI10 FeatureImpROC.csv"), row.names = TRUE)
+
+#######################
+#SFI-8#
+#######################
+socpredR1 <- Predictor$new(model = sfisoc, data = dfR1[, c(7:11, 50:52)], y = dfR1$mortality)
+
+socimpR1 <- FeatureImp$new(socpredR1, loss = aurocloss, compare = "difference", n.repetitions = 1000)
+
+socimpplotR1 <- plot(socimpR1)
+
+socimpplotR1 +
+  ggtitle("Figure 2C") +
+  scale_x_continuous(name = expression("Feature Importance (Loss: 1 - AU"[ROC]*")"), 
+                     breaks = c(0.00, 0.05, 0.10, 0.15, 0.20), 
+                     limits = c(-0.02, 0.20)) +
+  scale_y_discrete(name = NULL, labels = dfR1labs) +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13.5),      
+    axis.text = element_text(size = 13.5))
+
+dev.off()
+
+socimpR1res <- socimpR1$results
+socimpR1res
+write.csv(socimpR1res, file.path(outdir, "MIDUS R1 SFI8 FeatureImpROC.csv"), row.names = TRUE)
+```
+
+
+# R1 Feature importance - PRC
+
+```{r}
+#######################
+#SFI-10#
+#######################
+set.seed(555)
+sfiimpprcR1 <- FeatureImp$new(sfipredR1, loss = auprcloss, compare = "difference", n.repetitions = 1000)
+
+sfiimpprcplotR1 <- plot(sfiimpprcR1)
+
+pdf(file.path(outdir, "R1FeatureImpsPRC.pdf"), width = 5.1, height = 4)
+sfiimpprcplotR1 +
+  ggtitle("Supplemental Figure 2B") +
+  scale_x_continuous(name = expression("Feature Importance (Loss: 1 - AU"[PRC]*")"), 
+                     limits = c(-0.02, 0.10), 
+                     breaks = c(0.00, 0.02, 0.04, 0.06, 0.08, 0.10)) +
+  scale_y_discrete(name = NULL, labels = dfR1labs) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13.5),      
+    axis.text = element_text(size = 13.5))
+
+sfiimpprcR1res <- sfiimpprcR1$results
+sfiimpprcR1res
+write.csv(sfiimpprcR1res, file.path(outdir, "MIDUS R1 SFI10 FeatureImpPRC.csv"), row.names = TRUE)
+
+#######################
+#social predictors#
+#######################
+set.seed(555)
+socimpprcR1 <- FeatureImp$new(socpredR1, loss = auprcloss, compare = "difference", n.repetitions = 1000)
+
+socimpprcplotR1 <- plot(socimpprcR1)
+
+socimpprcplotR1 +
+  ggtitle("Supplemental Figure 2C") +
+  scale_x_continuous(name = expression("Feature Importance (Loss: 1 - AU"[PRC]*")"), 
+                     limits = c(-0.02, 0.06), 
+                     breaks = c(0.00, 0.02, 0.04, 0.06)) + 
+  scale_y_discrete(name = NULL, labels = dfR1labs) +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13.5),      
+    axis.text = element_text(size = 13.5))
+
+dev.off()
+
+socimpprcR1res <- socimpprcR1$results
+socimpprcR1res
+write.csv(socimpprcR1res, file.path(outdir, "MIDUS R1 SFI8 FeatureImpPRC.csv"), row.names = TRUE)
+```
+
+
+# Criterion testing
+
+The following, in tandem, produce the results presented in Table 2.
+
+### SFI-10 criterion
+
+```{r}
+######################
+#only with CIs#
+######################
+mpqposR1 <- c("mpq_wellbeing_R1", "mpq_socpotency_R1", "mpq_achieve_R1", "mpq_socclose_R1")
+mpqnegR1 <- c("mpq_stressreact_R1", "mpq_aggression_R1", "mpq_alienation_R1")
+
+allvars <- c("health_R1", "mehealth_R1", "badl_R1", "iadl_R1", pwbR1, swbR1, "affpos_R1", 
+             "affneg_R1", mpqposR1, mpqnegR1,
+             "fmly_affectsolidarity_R1", "frnd_affectsolidarity_R1")
+
+
+corrtablenop <- function(vars, targetvar, data) {
+  results <- data.frame(
+    variable = character(),
+    mean_sd = character(),
+    rho = character(),
+    z = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (var in vars) {
+    spearman_corr <- cor(data[[targetvar]], data[[var]], method = "spearman")
+    
+    z <- 0.5 * log((1 + spearman_corr) / (1 - spearman_corr))
+    
+    sez <- 1 / sqrt(length(data[[targetvar]]) - 3)
+    zlo <- z - qnorm(0.975) * sez
+    zhi <- z + qnorm(0.975) * sez
+    
+    rholo <- (exp(2 * zlo) - 1) / (exp(2 * zlo) + 1)
+    rhohi <- (exp(2 * zhi) - 1) / (exp(2 * zhi) + 1)
+    
+    rhocistr <- sprintf("%.2f [%.2f, %.2f]", spearman_corr, rholo, rhohi)
+    rhocistr <- sub("^0\\.", ".", rhocistr)
+    
+    meanv <- mean(data[[var]], na.rm = TRUE)
+    sdv <- sd(data[[var]], na.rm = TRUE)
+    meansdstr <- sprintf("%.2f (%.2f)", meanv, sdv)
+    
+    results <- rbind(results, data.frame(
+      variable = var,
+      mean_sd = meansdstr,
+      rho = rhocistr,
+      z = z
+    ))
+  }
+  
+  #apa#
+  results$z <- round(results$z, 2)
+  
+  return(results)
+}
+
+#save#
+sfiallcors <- corrtablenop(allvars, "SFIlp", data = dfR1)
+write.csv(sfiallcors, file.path(outdir, "R1sfiallcorrs.csv"), row.names = FALSE)
+```
+
+### SFI-8 criterion
+
+```{r}
+#corvars#
+allvars <- c("health_R1", "mehealth_R1", "badl_R1", "iadl_R1", pwbR1, swbR1, 
+             "affpos_R1", "affneg_R1", mpqposR1, mpqnegR1,
+             "fmly_affectsolidarity_R1", "frnd_affectsolidarity_R1")
+
+#save#
+sfisocallcors <- corrtablenop(allvars, "socSFIlp", data = dfR1)
+write.csv(sfisocallcors, file.path(outdir, "R1SFI8socallcorrs.csv"), row.names = FALSE)
+```
+
+### SFI-10 and SFI-8 different?
+
+```{r}
+lessvars <- c("health_R1", "mehealth_R1", pwbR1, swbR1, "affpos_R1", mpqposR1, 
+              "fmly_affectsolidarity_R1", "frnd_affectsolidarity_R1")
+greatervars <- c("affneg_R1", mpqnegR1, "badl_R1", "iadl_R1")
+
+r_kh <- cor(dfR1$socSFIlp, dfR1$SFIlp, method = "spearman")
+n <- nrow(dfR1)
+
+comparecortable <- function(vars, data, alternative) {
+  results <- data.frame(
+    variable = character(),
+    rho_socSFIlp = numeric(),
+    rho_SFIlp = numeric(),
+    p_value = numeric(),
+    alternative = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (var in vars) {
+    r_jk <- cor(data[[var]], data$socSFIlp, method = "spearman")
+    r_jh <- cor(data[[var]], data$SFIlp, method = "spearman")
+    
+    result <- cocor.dep.groups.overlap(
+      r.jk = r_jk, 
+      r.jh = r_jh, 
+      r.kh = r_kh, 
+      n = n, 
+      alternative = alternative,
+      alpha = 0.05,
+      conf.level = 0.95
+    )
+    
+    results <- rbind(results, data.frame(
+      variable = var,
+      rho_SFIlp = round(r_jh, 3),
+      rho_socSFIlp = round(r_jk, 3),
+      p_value = round(result@steiger1980$p.value, 4),
+      alternative = alternative
+    ))
+  }
+  
+  return(results)
+}
+
+#less#
+lesstestcors <- comparecortable(lessvars, dfR1, alternative = "less")
+
+#greater#
+greatertestcors <- comparecortable(greatervars, dfR1, alternative = "greater")
+
+#combine
+alltestcors <- rbind(lesstestcors, greatertestcors)
+
+alltestcors$p_value_adj <- p.adjust(alltestcors$p_value, method = "BH")
+
+print(alltestcors)
+write.csv(alltestcors, file.path(outdir, "R1sfitestcorss.csv"), row.names = FALSE)
+```
+
+
+### Age + criterion checks
+
+```{r}
+#corvars#
+allvars <- c("health_R1", "mehealth_R1", "badl_R1", "iadl_R1", pwbR1, swbR1, 
+             "affpos_R1", "affneg_R1", mpqposR1, mpqnegR1,
+             "fmly_affectsolidarity_R1", "frnd_affectsolidarity_R1")
+
+#save#
+ageallcors <- corrtablenop(allvars, "age", data = dfR1)
+write.csv(ageallcors, file.path(outdir, "R1ageallcorrs.csv"), row.names = FALSE)
+```
+
+
+# Correlations between age + SFI vars
+
+```{r}
+#######################
+#need to recode variables first so that higher value#
+#direction associated with mortality in SFI#
+#######################
+colnames(dfR1oc)[c(5:11, 50:52)] <- c("sex", "age", "neighborhood", "financial_control", 
+                                      "freq_children", "activities_youth", "work", "volunteering", 
+                                      "feel_isolated", "courtresp")
+#age#
+#no change#
+
+#sex#
+dfR1oc$sex <- as.numeric(dfR1oc$sex)
+
+#neighborhood clean?#
+#no change#
+table(dfR1oc$neighborhood)
+
+#financial control#
+#REVERSE 0-10#
+table(dfR1oc$financial_control)
+dfR1oc$financial_control <- 10 - dfR1oc$financial_control
+table(dfR1oc$financial_control)
+
+#family contact#
+#no change#
+table(dfR1oc$freq_children)
+
+#friend contact#
+#no change#
+table(dfR1oc$activities_youth)
+
+#work#
+#REVERSE 0-1#
+table(dfR1oc$work)
+dfR1oc$work <- 1 - dfR1oc$work
+table(dfR1oc$work)
+
+#volunteer#
+#no change#
+
+#feel isolated#
+#currently 1 = high, 13 = low#
+#REVERSE 1-13#
+table(dfR1oc$feel_isolated)
+dfR1oc$feel_isolated <- 14 - dfR1oc$feel_isolated
+table(dfR1oc$feel_isolated)
+
+#treated courtesy/respect#
+table(dfR1oc$courtresp)
+dfR1oc$courtresp <- 8 - dfR1oc$courtresp
+table(dfR1oc$courtresp)
+
+#######################
+#correlations of social items with age raw HRS#
+#######################
+ogcordfspearR1 <- dfR1oc[c(6, 7:10, 51, 52)]
+view(ogcordfspearR1)
+ogcordfpearR1 <- dfR1oc[c(6, 11, 50)]
+view(ogcordfpearR1)
+
+ogcordatpearR1 <- cor(ogcordfpearR1, method = "pearson")
+ogcordatspearR1 <- cor(ogcordfspearR1, method = "spearman")
+subsetogpearR1 <- ogcordatpearR1["age", ,drop = FALSE]
+subsetogspearR1 <- ogcordatspearR1["age", ,drop = FALSE]
+
+ogcordR1 <- cbind(subsetogpearR1, subsetogspearR1)
+ogcordatR1 <- as.data.frame(ogcordR1)
+ogcordatR1 <- ogcordatR1[, c("age", "age", "freq_children", "activities_youth", "volunteering", 
+                          "feel_isolated", "neighborhood", "financial_control", "courtresp", 
+                          "work")]
+ogcordatR1 <- ogcordatR1[, c(-2)]
+ogcordatR1 <- as.matrix(ogcordatR1)
+colnames(ogcordatR1) <- dfR1labs[colnames(ogcordatR1)]
+rownames(ogcordatR1) <- dfR1labs[rownames(ogcordatR1)]
+
+#visualize#
+png(file.path(outdir, "R1agesocialitemscors.png"), width = 9, height = 9, units = "in", res = 600)
+socogplot <- corrplot(t(ogcordatR1), method = "color", addCoef.col = "#000000", 
+                      col = colorRampPalette(c("#6A4C93", "white", "#27933E"))(200),  
+                      col.lim = c(-1, 1), tl.cex = 1.4, tl.col = "grey30", 
+                      cl.pos = 'n', number.cex = 1)
+dev.off()
+
+#######################
+#following up on positive correlations#
+#######################
+#volunteering#
+cor.test(dfR1oc$age, dfR1oc$volunteering, alternative = "greater", 
+         method = "pearson", exact = NULL, conf.level = 0.95)
+
+#working
+cor.test(dfR1oc$age, dfR1oc$work, alternative = "greater", 
+         method = "pearson", exact = NULL, conf.level = 0.95)
+```

@@ -1,0 +1,2584 @@
+---
+title: "HRS SFI Analysis"
+author: "Charlie Collinge"
+date: "2026-01-09"
+output: html_document
+---
+
+# Set up 
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+
+#setup#
+library(tidyverse)
+library(haven)
+library(openxlsx)
+library(corrplot)
+library(RColorBrewer)
+library(pROC)
+library(PRROC)
+library(iml)
+library(rms)
+library(boot)
+
+#specify an out directory for results & visualization#
+outdir <- "/example/directory/"
+
+#set working directory to location of data files#
+setwd("/example/HRSfiles/")
+
+#import RAND HRS longitudinal file 2020 V2 released May 2024, downloaded 3/17/25#
+lrand <- read_sav(paste0(getwd(), "/randhrs1992_2020v2_SPSS/randhrs1992_2020v2.sav"))
+names(lrand) <- tolower(names(lrand))
+```
+
+
+# Completion of Form LB in 2010 & 65+ 
+
+```{r}
+#Shah et al. use the HRS cross-wave tracker (2016 version) to ascertain#
+#their analytic cohorts, and then combine this with RAND HRS fat files for further analysis.#
+#See: https://github.com/sachinjshah/Social-Frailty-Index/blob/main/Step1_cohort_identification.sas#
+
+#RAND HRS data products were constructed using the HRS core data products (e.g. the tracker file)#
+#and contain cleaned and processed variables with consistent and intuitive naming conventions,# 
+#model-based imputations, and spousal counterparts of most individual-level variables.#
+#See: https://www.rand.org/health/surveys/hrs.html. 
+
+#To ensure consistency in variable naming and imputation practices, only RAND HRS products#
+#were used in this analysis. Thus Shah et al.'s cohort identification pipeline was conducted#
+#substituting analogous RAND variables where necessary.#
+
+#Only include individuals who completed any#
+#leave behind questionnaire between 2006 and 2014 (waves 8-12).#
+#This is a replication of Shah et al.'s cohort identification procedure#
+#but is not necessarily pertinent here since final cohort specifications#
+#were already published.#
+lbcols <- c("r8lbcomp", "r9lbcomp", "r10lbcomp", "r11lbcomp", "r12lbcomp")
+lrand <- lrand[apply(!is.na(lrand[, lbcols]), 1, any), ]
+
+#2010 completion#
+c10 <- lrand[lrand$r10lbcomp == 1, ]
+c10$lb_year <- 2010
+c10 <- c10[!is.na(c10$r10lbcomp), ]
+
+#N = 8332 (8332 reported at https://github.com/sachinjshah/Social-Frailty-Index); 
+
+#age 65+?#
+#note: Shah et al. use "mage > 65", so technically 66+#
+#using r10agem_e for age (in months to use most restrictive unit)# 
+#at END of interview (see RAND longitudinal p. 129).#
+#Note: 66 * 12 = 792 so "> 791"#
+c10 <- c10[c10$r10agem_e > 791, ]
+
+#N = 4308 (4302 reported by Shah et al.)#
+```
+
+
+# Create final df for 2010 cohort 
+
+```{r}
+#set wd#
+setwd("/example/HRSfiles/")
+
+#required for sample descriptive stats#
+lranddescvars <- c("r10iwstat", "hacohort", 
+                   "raracem", "rahispan", "raeduc", 
+                   "r10shlt", "r10diabe", "r10cancre",  "r10hearte",
+                   "r10stroke", "r10arthre", 
+                   "r10smokev", "r10smoken",
+                   "h10itot")
+
+#required for sfi#
+lrandsfivars <- c("hhidpn", "r10lbcomp", "lb_year", "ragender", "r10agey_e", 
+               "r10agem_e", "r10iwbeg", "r10iwendm", "r10iwendy", 
+               "radyear", "radmonth")
+
+c10 <- c10[, c(lranddescvars, lrandsfivars)]
+
+#convert r10iwbeg from SAS f8.0 date (days since 1/1/1960)#
+#to year and month#
+c10$r10iwbeg_r <- as.Date(c10$r10iwbeg, origin = "1960-01-01")
+
+c10$iwbeg_y <- format(c10$r10iwbeg_r, "%Y")
+c10$iwbeg_y <- as.numeric(c10$iwbeg_y)
+c10$iwbeg_m <- format(c10$r10iwbeg_r, "%m")
+c10$iwbeg_m <- as.numeric(c10$iwbeg_m)
+
+#import RAND HRS 2010 fat file V6A released July 2022, downloaded 3/17/25#
+rand10 <- read_sav(paste0(getwd(), "/hd10f6a_SPSS/hd10f6a.sav"))
+names(rand10) <- tolower(names(rand10))
+
+clb10 <- merge(c10, rand10, by = "hhidpn", all.x = TRUE)
+
+df10 <- clb10[, c(lranddescvars, lrandsfivars, "iwbeg_y", "iwbeg_m",
+                  "md171", "mc095", "mc103", "mc104", "mc105",
+                  "mlb021f", "mlb026", "mlb009a", "mlb001b", 
+                  "mlb045", "mlb001d", "mlb020c", "mlb030a")]
+```
+
+
+# Mortality 
+
+```{r}
+#basing "4yr" mortality calculation on Shah et al.'s actual criteria (not 4yr mortality)#
+#via authors: We mentioned "4-year mortality" in the paper, but the way we defined the#
+#death_flag (the outcome, a binary indicator) was to include all deaths that occurred by#
+#the end of 2015 (Dec 31, 2015) for the 2010 cohort.#
+
+#note: dates cannot be narrowed down from the month level#
+#note: <= 2016 because December, 2015 would be 2015 + 1#
+#in the formula below, so 2016#
+
+df10$DOD <- df10$radyear + df10$radmonth / 12
+df10$mortality <- ifelse(is.na(df10$DOD), 0,
+                         ifelse(df10$DOD <= 2016, 1, 0))
+
+table(df10$mortality == 1)
+#935/4308 compared to 960/4302 published#
+
+#checking when died#
+df10$interview <- df10$r10iwendy + df10$r10iwendm / 12
+df10$mortalitytime <- df10$DOD - df10$interview
+
+summary(df10$mortalitytime[df10$mortality == 1])
+hist(df10$mortalitytime[df10$mortality == 1], breaks = "sturges", freq = FALSE, 
+     main = "2010 Cohort: Mortality Time", xlab = "Time (Years)")
+lines(density(df10$mortalitytime[df10$mortality == 1]), col = "#27933E")
+
+#checking outcome assessment window#
+df10$outcometime <- 2016 - df10$interview
+summary(df10$outcometime)
+```
+
+
+Total mortality suggested = 935
+Max mortality time = 5.75 years
+Shah et al. (2023) PNAS reported = 960
+
+
+# 2010 Descriptive Stats 
+
+The following 2 sections can be combined to recreate the descriptive statistics in Table S1.
+
+### Descriptive stats - demographics, health status, function 
+
+```{r}
+#####################
+#demographics#
+#####################
+#age (median+IQR)#
+summary(df10$r10agey_e)
+hist(df10$r10agey_e, breaks = "sturges", freq = FALSE, 
+     main = "2010 Cohort: Age", xlab = "Age (Years)")
+lines(density(df10$r10agey_e), col = "#27933E")
+
+#sex (female+%)#
+table(df10$ragender == 2)
+
+
+#####################
+#health status#
+#####################
+#fair or poor self reported health (N+%)#
+table(!is.na(df10$r10shlt))
+table(df10$r10shlt  %in% c(4, 5))
+
+#diabetes (N+%)#
+table(df10$r10diabe == 1)
+
+#cancer (excluding minor skin cancer) (N+%)#
+table(df10$r10cancre == 1)
+
+#heart disease (N+%)#
+table(df10$r10hearte == 1)
+
+#stroke (N+%)#
+table(df10$r10stroke == 1)
+
+#arthritis (N+%)#
+table(df10$r10arthre == 1)
+
+#current smoker? (N+%)#
+table(df10$r10smoken == 1)
+
+#former smoker? (N+%)#
+table(df10$r10smokev == 1 & df10$r10smoken == 0)
+
+
+#####################
+#mortality#
+#####################
+#mortality#
+table(df10$mortality == 1)
+
+
+#####################
+#summarize#
+#####################
+N <- 4308
+
+freq_percent <- function(var, condition) {
+  freq <- sum(var %in% condition, na.rm = TRUE)  
+  perc <- (freq / N) * 100              
+  return(paste0(freq, " (", round(perc, 2), "%)"))
+}
+
+freq_percentlog <- function(var, condition) {
+  freq <- sum(condition, na.rm = TRUE)
+  perc <- (freq / length(var)) * 100
+  paste0(freq, " (", round(perc, 2), "%)")
+}
+
+# Generate table with relevant variables
+c10stats <- data.frame(
+  Variable = c(
+    "Fair or Poor Self-Reported Health",
+    "Diabetes",
+    "Cancer (excluding minor skin cancer)",
+    "Heart Disease",
+    "Stroke",
+    "Arthritis",
+    "Current Smoker",
+    "Former Smoker"
+  ),
+  `N (%)` = c(
+    freq_percent(df10$r10shlt, c(4, 5)), 
+    freq_percent(df10$r10diabe, 1),  
+    freq_percent(df10$r10cancre, 1),  
+    freq_percent(df10$r10hearte, 1),  
+    freq_percent(df10$r10stroke, 1),  
+    freq_percent(df10$r10arthre, 1),  
+    freq_percent(df10$r10smoken, 1),  
+    freq_percent(df10$r10smokev[df10$r10smoken == 0], 1)
+  )
+)
+
+write.csv(c10stats, file.path(outdir, "2010 HRS health and function.csv"), row.names = TRUE)
+```
+
+
+### Descriptive stats - social characteristics 
+
+```{r}
+#####################
+#general#
+#####################
+#race (N+%)#
+table(df10$raracem)
+table(!is.na(df10$raracem))
+
+#ethnicity (N+%)#
+table(df10$rahispan)
+table(!is.na(df10$rahispan))
+
+#education (N+%)#
+table(df10$raeduc)
+table(!is.na(df10$raeduc))
+
+#income (N+%)#
+summary(df10$h10itot)
+hist(df10$h10itot, breaks = "sturges", freq = FALSE, 
+     xaxt = 'n', ylim = c(0, 0.000020),
+     main = "2010 Cohort: Household Income", xlab = "Annual Income (USD)")
+axis(side = 1, at = pretty(range(df10$h10itot)), labels = pretty(range(df10$h10itot)))
+lines(density(df10$h10itot), col = "#27933E")
+
+
+#####################
+#SFI-10 vars#
+#####################
+#all tables based on functional forms analysis below#
+#neighborhood unclean#
+#code (< 4) to (0); (>= 4) to (1)#
+table(df10$mlb021f >= 4)
+
+#low financial control#
+#code (< 2) to (0); (>= 2) to (1)#
+table(df10$mlb026 < 2)
+
+#meets with children less than once/year#
+#code (<= 5) to (0); (6) to (1)#
+table(df10$mlb009a == 6)
+
+#activities w/ youth#
+summary(df10$mlb001b)
+
+#work#
+table(df10$mlb045 == 1)
+
+#no volunteer#
+#code (<= 6) to (0); (7) to (1)#
+table(df10$mlb001d == 7)
+
+#loneliness#
+table(df10$mlb020c)
+
+#courtesy/respect#
+#code (<= 4) to (0); (5, 6) to (1)#
+table(df10$mlb030a <= 4)
+
+#####################
+#summarize#
+#####################
+N = 4308
+
+c10descstats <- data.frame(
+  Variable = c(
+    "Black",
+    "White",
+    "Other", 
+    "Hispanic origin", 
+    "Not of hispanic origin", 
+    "Less than high school", 
+    "High school diploma or equiv", 
+    "Some college", 
+    "College and above",
+    "< $56,599", 
+    "$56,600 - 169,799", 
+    "> $169,800", 
+    "Age", 
+    "Sex (Female)", 
+    "Neighborhood is not clean", 
+    "Low percieved financial control", 
+    "Meets with children less than once per year or equivalent", 
+    "Activities with younger folks or equivalent", 
+    "Presently working", 
+    "Does no volunteer/charity work", 
+    "Feels isolated often", 
+    "Feels isolated some of the time", 
+    "Feels isolated hardly ever or never",
+    "Often treated with less courtesy and respect than others"
+  ),
+  `N (%)` = c(
+    freq_percent(df10$raracem, 2),
+    freq_percent(df10$raracem, 1),
+    freq_percent(df10$raracem, 3),
+    freq_percent(df10$rahispan, 1), 
+    freq_percent(df10$rahispan, 0),
+    freq_percent(df10$raeduc, 1),
+    freq_percent(df10$raeduc, 2:3),
+    freq_percent(df10$raeduc, 4),
+    freq_percent(df10$raeduc, 5),
+    freq_percentlog(df10$h10itot, df10$h10itot < 56600),
+    freq_percentlog(df10$h10itot, df10$h10itot >= 56600 & df10$h10itot <= 169799),
+    freq_percentlog(df10$h10itot, df10$h10itot > 169799),
+    paste0(round(median(df10$r10agey_e), 2), 
+           " [", round(summary(df10$r10agey_e)[2], 2),",", 
+           round(summary(df10$r10agey_e)[5], 2), "]"), 
+    freq_percent(df10$ragender, 2), 
+    freq_percent(df10$mlb021f, 4:10), 
+    freq_percent(df10$mlb026, 0:1), 
+    freq_percent(df10$mlb009a, 6), 
+    paste0(round(median(df10$mlb001b), 2), 
+           " [", round(summary(df10$mlb001b)[2], 2), ",",
+           round(summary(df10$mlb001b)[5], 2), "]"),
+    freq_percent(df10$mlb045, 1), 
+    freq_percent(df10$mlb001d, 7), 
+    freq_percent(df10$mlb020c, 1), 
+    freq_percent(df10$mlb020c, 2),
+    freq_percent(df10$mlb020c, 3),
+    freq_percent(df10$mlb030a, 1:4)
+  )
+)
+
+write.csv(c10descstats, file.path(outdir, "2010 HRS descriptive stats.csv"), row.names = TRUE)
+```
+
+
+# Find median (continuous) & mode values 
+
+```{r}
+findmode <- function(x) {
+  freq_table <- table(x)
+  mode <- as.numeric(names(freq_table[freq_table == max(freq_table)]))
+  return(mode)
+}
+
+#######################
+#age (r10agey_e)#
+#######################
+median(df10$r10agey_e, na.rm = TRUE)
+
+#median: 75#
+
+#######################
+#gender (ragender)#
+#######################
+findmode(df10$ragender)
+
+#mode: 2 (woman)#
+
+#######################
+#neighborhood clean (mlb021f)#
+#######################
+findmode(df10$mlb021f)
+
+#mode: 1 (highest agreement with "this area is kept very clean")#
+
+#######################
+#financial control (mlb026)#
+#######################
+findmode(df10$mlb026)
+
+#mode: 10 (very much control)#
+
+#######################
+#has children/freq. seeing (mlb009a)#
+#######################
+findmode(df10$mlb009a)
+
+#mode: 2 (once or twice a week)#
+
+#######################
+#activities w/ younger folks; grandchildren, etc. (mlb001b)#
+#######################
+findmode(df10$mlb001b)
+
+#mode: 7 (never/not relevant) *note; Shah et al. imputed "5" as the mode value#
+#(https://github.com/sachinjshah/Social-Frailty-Index/blob/main/Detailed%20instructions#
+#%20to%20calculate%20SFI%20with%20user%20input.pdf) did they treat this as continuous?#
+median(df10$mlb001b, na.rm = TRUE)
+
+#median: 5 (at least once a month)#
+
+#######################
+#work (mlb045)#
+#######################
+findmode(df10$mlb045)
+
+#mode: 5 (No)#
+
+#######################
+#other volunteer/charity work (mlb001d)#
+#######################
+findmode(df10$mlb001d)
+
+#mode: 7 (never/not relevant)#
+
+#######################
+#feel isolated (mlb020c)#
+#######################
+findmode(df10$mlb020c)
+
+#mode: 3 (hardly ever or never)#
+
+#######################
+#treated w/ less courtesy/respect (mlb030a)#
+#######################
+findmode(df10$mlb030a)
+
+#mode: 6 (never)#
+```
+
+
+# Single imputation of median and mode for missing values 
+
+```{r}
+#######################
+#age (r10agey_e)#
+#######################
+table(!is.na(df10$r10agey_e))
+df10$r10agey_e[is.na(df10$r10agey_e)] <- 75
+table(!is.na(df10$r10agey_e))
+
+#######################
+#sex (ragender)#
+#######################
+table(!is.na(df10$ragender))
+df10$ragender[is.na(df10$ragender)] <- 2
+table(!is.na(df10$ragender))
+
+#######################
+#neighborhood clean (mlb021f)#
+#######################
+table(!is.na(df10$mlb021f))
+df10$mlb021f[is.na(df10$mlb021f)] <- 1
+table(!is.na(df10$mlb021f))
+
+#######################
+#financial control (mlb026)#
+#######################
+table(!is.na(df10$mlb026))
+df10$mlb026[is.na(df10$mlb026)] <- 10
+table(!is.na(df10$mlb026))
+
+#######################
+#has children/freq. seeing (mlb009a)#
+#######################
+table(!is.na(df10$mlb009a))
+df10$mlb009a[is.na(df10$mlb009a)] <- 2
+table(!is.na(df10$mlb009a))
+
+#######################
+#activities w/ younger folks; grandchildren, etc. (mlb001b)#
+#######################
+#creating dummy mlb001b var for comparison to what Shah et al. (2023) did#
+df10$mlb001bdummy <- df10$mlb001b
+table(!is.na(df10$mlb001bdummy))
+df10$mlb001bdummy[is.na(df10$mlb001bdummy)] <- 5
+table(!is.na(df10$mlb001bdummy))
+
+#true recoding#
+table(!is.na(df10$mlb001b))
+df10$mlb001b[is.na(df10$mlb001b)] <- 7
+table(!is.na(df10$mlb001b))
+
+#######################
+#work (mlb045)#
+#######################
+table(!is.na(df10$mlb045))
+df10$mlb045[is.na(df10$mlb045)] <- 5
+table(!is.na(df10$mlb045))
+
+#######################
+#other volunteer/charity work (mlb001d)#
+#######################
+table(!is.na(df10$mlb001d))
+df10$mlb001d[is.na(df10$mlb001d)] <- 7
+table(!is.na(df10$mlb001d))
+
+#######################
+#feel isolated (mlb020c)#
+#######################
+table(!is.na(df10$mlb020c))
+df10$mlb020c[is.na(df10$mlb020c)] <- 3
+table(!is.na(df10$mlb020c))
+
+#######################
+#treated w/ less courtesy/respect (mlb030a)#
+#######################
+table(!is.na(df10$mlb030a))
+df10$mlb030a[is.na(df10$mlb030a)] <- 6
+table(!is.na(df10$mlb030a))
+```
+
+
+# Recode vars to manual PNAS coding 
+
+```{r}
+#######################
+#create dummy df for og coding#
+#######################
+df10og <- df10
+df10ff <- df10
+
+#######################
+#age (r10agey_e)#
+#no change in Shah et al. (2023)#
+#######################
+
+#######################
+#gender (ragender)#
+#######################
+#check#
+table(df10ff$ragender)
+
+#code male (1) to (0); female (2) to (1) per Shah et al. (2023)#
+df10ff$ragender[df10ff$ragender == 1] <- 0
+df10ff$ragender[df10ff$ragender == 2] <- 1
+
+#check#
+table(df10ff$ragender)
+
+#######################
+#neighborhood clean? (mlb021f)#
+#######################
+#check#
+table(df10ff$mlb021f)
+
+#code (< 4) to (0); (>= 4) to (1) per Shah et al. (2023)#
+df10ff$mlb021f <- ifelse(df10ff$mlb021f < 4, 0, 1)
+
+#check#
+table(df10ff$mlb021f)
+
+#######################
+#financial control (mlb026)#
+#######################
+#check#
+table(df10ff$mlb026)
+
+#code (< 4) to (0); (>= 4) to (1) per Shah et al. (2023)#
+#BUT, since categorical model actually preferred, used#
+#(< 2) to (0) and >= 2 to (1) to increase interpretability#
+#and got lowest BIC#
+df10ff$mlb026 <- ifelse(df10ff$mlb026 < 2, 0, 1)
+
+#check#
+table(df10ff$mlb026)
+
+#######################
+#has children/freq. seeing (mlb009a)#
+#######################
+#check#
+table(df10ff$mlb009a)
+
+#code (<= 5) to (0); (6) to (1) per Shah et al. (2023)#
+df10ff$mlb009a <- ifelse(df10ff$mlb009a < 6, 0, 1)
+
+#check#
+table(df10ff$mlb009a)
+
+#######################
+#activities w/ younger folks; grandchildren, etc. (mlb001b)#
+#no change in Shah et al. (2023)
+#######################
+#check#
+table(df10ff$mlb001b)
+
+#######################
+#work (mlb045)#
+#######################
+#check#
+table(df10ff$mlb045)
+
+#code (5) to (0), no change in (1) per Shah et al. (2023)#
+df10ff$mlb045[df10ff$mlb045 == 5] <- 0
+  
+#check#
+table(df10ff$mlb045)
+
+#######################
+#other volunteer/charity work (mlb001d)#
+#######################
+#check#
+table(df10ff$mlb001d)
+
+#code (<= 6) to (0); (7) to (1) per Shah et al. (2023)#
+df10ff$mlb001d <- ifelse(df10ff$mlb001d < 7, 0, 1)
+
+#check#
+table(df10ff$mlb001d)
+
+#######################
+#feel isolated (mlb020c)#
+#######################
+#check#
+table(df10ff$mlb020c)
+
+#code (1) to (0); (2) to (1); (3) to (2) per Shah et al. (2023)#
+df10ff$mlb020c <- df10ff$mlb020c - 1
+
+#check#
+table(df10ff$mlb020c)
+
+#######################
+#treated w/ less courtesy/respect (mlb030a)#
+#######################
+#check#
+table(df10ff$mlb030a)
+
+#code (<= 4) to (0); (5, 6) to (1) per Shah et al. (2023)# 
+df10ff$mlb030a <- ifelse(df10ff$mlb030a < 5, 0, 1)
+
+#check#
+table(df10ff$mlb030a)
+```
+
+
+# Functional forms 
+
+```{r}
+#######################
+#var types#
+#######################
+continuousvars <- c("age (r10agey_e)")
+ordinalvars <- c("neighborhood clean (mlb021f)", "financial control (mlb026)", 
+                 "has children/freq. seeing (mlb009a)","activities w/ younger folks; grandchildren, etc. (mlb001b)", 
+                 "other volunteer/charity work (mlb001d)", 
+                 "feel isolated (mlb020c)", "treated w/ less courtesy/respect (mlb030a)")
+binaryvars <- c("gender (gender)", "currently working (mlb045)")
+
+#note: not assessing functional forms of binary predictors#
+
+#######################
+#continuous#
+#######################
+
+########
+#age#
+alin <- glm(mortality ~ r10agey_e, data = df10og, family = binomial, na.action = na.omit)
+
+df10og$logage <- log(df10og$r10agey_e + 1)
+alog <- glm(mortality ~ logage, data = df10og, family = binomial, na.action = na.omit)
+
+df10og$expage <- exp(df10og$r10agey_e)
+aexp <- glm(mortality ~ expage, data = df10og, family = binomial, na.action = na.omit)
+
+abic <- data.frame(
+  Model = c("Linear", "Log", "Exp"),
+  BIC = c(BIC(alin), BIC(alog), BIC(aexp))
+)
+
+print(abic)
+
+
+#######################
+#ordinal#
+#######################
+
+########
+#neighborhood clean (mlb021f)#
+nclin <- glm(mortality ~ mlb021f, data = df10og, family = binomial, na.action = na.omit)
+
+df10og[, "mlb021f"] <- as.factor(df10og[,"mlb021f"])
+nccat <- glm(mortality ~ mlb021f, data = df10og, family = binomial, na.action = na.omit)
+
+ncman <- glm(mortality ~ as.factor(mlb021f), data = df10ff, family = binomial, na.action = na.omit)
+
+ncbic <- data.frame(
+  Model = c("Linear", "Categorical", "Binary"),
+  BIC = c(BIC(nclin), BIC(nccat), BIC(ncman))
+)
+
+print(ncbic)
+
+########
+#financial control (mlb026)# 
+fclin <- glm(mortality ~ mlb026, data = df10og, family = binomial, na.action = na.omit)
+
+df10og[, "mlb026"] <- as.factor(df10og[,"mlb026"])
+fccat <- glm(mortality ~ mlb026, data = df10og, family = binomial, na.action = na.omit)
+
+fcman <- glm(mortality ~ as.factor(mlb026), data = df10ff, family = binomial, na.action = na.omit)
+
+fcbic <- data.frame(
+  Model = c("Linear", "Categorical", "Binary"),
+  BIC = c(BIC(fclin), BIC(fccat), BIC(fcman))
+)
+
+print(fcbic)
+
+
+########
+#has children/freq. seeing (mlb009a)# 
+hcfslin <- glm(mortality ~ mlb009a, data = df10og, family = binomial, na.action = na.omit)
+
+df10og[, "mlb009a"] <- as.factor(df10og[,"mlb009a"])
+hcfscat <- glm(mortality ~ mlb009a, data = df10og, family = binomial, na.action = na.omit)
+
+hcfsman <- glm(mortality ~ as.factor(mlb009a), data = df10ff, family = binomial, na.action = na.omit)
+
+hcfsbic <- data.frame(
+  Model = c("Linear", "Categorical", "Binary"),
+  BIC = c(BIC(hcfslin), BIC(hcfscat), BIC(hcfsman))
+)
+
+print(hcfsbic)
+
+
+########
+#activities w/ younger folks; grandchildren, etc. (mlb001b)#
+ayflin <- glm(mortality ~ mlb001b, data = df10og, family = binomial, na.action = na.omit)
+
+df10og[, "mlb001b"] <- as.factor(df10og[,"mlb001b"])
+ayfcat <- glm(mortality ~ mlb001b, data = df10og, family = binomial, na.action = na.omit)
+
+ayfman <- glm(mortality ~ as.factor(mlb001b), data = df10ff, family = binomial, na.action = na.omit)
+
+ayfbic <- data.frame(
+  Model = c("Linear", "Categorical", "Binary"),
+  BIC = c(BIC(ayflin), BIC(ayfcat), BIC(ayfman))
+)
+
+print(ayfbic)
+
+
+########
+#other volunteer/charity work (mlb001d)#
+vlin <- glm(mortality ~ mlb001d, data = df10og, family = binomial, na.action = na.omit)
+
+df10og[, "mlb001d"] <- as.factor(df10og[,"mlb001d"])
+vcat <- glm(mortality ~ mlb001d, data = df10og, family = binomial, na.action = na.omit)
+
+vman <- glm(mortality ~ as.factor(mlb001d), data = df10ff, family = binomial, na.action = na.omit)
+
+vbic <- data.frame(
+  Model = c("Linear", "Categorical", "Binary"),
+  BIC = c(BIC(vlin), BIC(vcat), BIC(vman))
+)
+
+print(vbic)
+
+########
+#feel isolated (mlb020c)#
+lolin <- glm(mortality ~ mlb020c, data = df10og, family = binomial, na.action = na.omit)
+
+df10og[, "mlb020c"] <- as.factor(df10og[,"mlb020c"])
+locat <- glm(mortality ~ mlb020c, data = df10og, family = binomial, na.action = na.omit)
+
+loman <- glm(mortality ~ as.factor(mlb020c), data = df10ff, family = binomial, na.action = na.omit)
+
+lobic <- data.frame(
+  Model = c("Linear", "Categorical", "Binary"),
+  BIC = c(BIC(lolin), BIC(locat), BIC(loman))
+)
+
+print(lobic)
+
+
+########
+#treated w/ less courtesy/respect (mlb030a)#
+crlin <- glm(mortality ~ mlb030a, data = df10og, family = binomial, na.action = na.omit)
+
+df10og[, "mlb030a"] <- as.factor(df10og[,"mlb030a"])
+crcat <- glm(mortality ~ mlb030a, data = df10og, family = binomial, na.action = na.omit)
+
+crman <- glm(mortality ~ as.factor(mlb030a), data = df10ff, family = binomial, na.action = na.omit)
+
+crbic <- data.frame(
+  Model = c("Linear", "Categorical", "Binary"),
+  BIC = c(BIC(crlin), BIC(crcat), BIC(crman))
+)
+
+print(crbic)
+
+summary <- cbind(abic$BIC, ncbic$BIC, fcbic$BIC, hcfsbic$BIC, ayfbic$BIC,
+                 vbic$BIC, lobic$BIC, crbic$BIC)
+colnames(summary) <- c("age", "neighborhood cleanliness", "financial control", 
+                       "freq. see children", "activities with youth", "volunteer", "feel isolated", "courtesy/respect")
+rownames(summary) <- c("1", "2", "3")
+summary <- as.data.frame(summary)
+summary
+
+write.csv(summary, file.path(outdir, "HRS functional forms.csv"), row.names = FALSE)
+```
+
+
+# Recode variables based on functional forms 
+
+```{r}
+#######################
+#age (r10agey_e)#
+#no change#
+#######################
+
+#######################
+#gender (gender)#
+#######################
+#check#
+table(df10$ragender)
+
+#code male (1) to (0); female (2) to (1) per Shah et al. (2023)#
+df10$ragender[df10$ragender == 1] <- 0
+df10$ragender[df10$ragender == 2] <- 1
+
+#check#
+table(df10$ragender)
+
+#######################
+#neighborhood clean? (mlb021f)#
+#######################
+#check#
+table(df10$mlb021f)
+
+#code (< 4) to (0); (>= 4) to (1) per Shah et al. (2023)#
+df10$mlb021f <- ifelse(df10$mlb021f < 4, 0, 1)
+
+#check#
+table(df10$mlb021f)
+
+#######################
+#financial control (mlb026)#
+#######################
+#check#
+table(df10$mlb026)
+
+#code (< 2) to (0); (>= 2) to (1) per my manual categorization#
+df10$mlb026 <- ifelse(df10$mlb026 < 2, 0, 1)
+
+#check#
+table(df10$mlb026)
+
+#######################
+#has children/freq. seeing (mlb009a)#
+#######################
+#check#
+table(df10$mlb009a)
+
+#code (<= 5) to (0); (6) to (1) per Shah et al. (2023)#
+df10$mlb009a <- ifelse(df10$mlb009a < 6, 0, 1)
+
+#check#
+table(df10$mlb009a)
+
+#######################
+#activities w/ younger folks; grandchildren, etc. (mlb001b)#
+#no change#
+#######################
+#check#
+table(df10$mlb001b)
+
+#######################
+#work (mlb045)#
+#######################
+#check#
+table(df10$mlb045)
+
+#code (5) to (0), no change in (1) per Shah et al. (2023)#
+df10$mlb045[df10$mlb045 == 5] <- 0
+  
+#check#
+table(df10$mlb045)
+
+#######################
+#other volunteer/charity work (mlb001d)#
+#######################
+#check#
+table(df10$mlb001d)
+
+#code (<= 6) to (0); (7) to (1) per Shah et al. (2023)#
+df10$mlb001d <- ifelse(df10$mlb001d < 7, 0, 1)
+
+#check#
+table(df10$mlb001d)
+
+#######################
+#feel isolated (mlb020c)#
+#######################
+#check#
+table(df10$mlb020c)
+
+#code (1) to (0); (2) to (1); (3) to (2) per Shah et al. (2023)#
+df10$mlb020c <- df10$mlb020c - 1
+
+#check#
+table(df10$mlb020c)
+
+#######################
+#treated w/ less courtesy/respect (mlb030a)#
+#######################
+#check#
+table(df10$mlb030a)
+
+#code (<= 4) to (0); (5, 6) to (1) per Shah et al. (2023)# 
+df10$mlb030a <- ifelse(df10$mlb030a < 5, 0, 1)
+
+#check#
+table(df10$mlb030a)
+```
+
+
+# Change variable names for modeling and visualization 
+
+```{r}
+sficolnames10 <- c("r10agey_e" = "age", 
+                 "ragender" = "sex", 
+                 "mlb021f" = "neighborhood", 
+                 "mlb026" = "financial_control", 
+                 "mlb009a" = "freq_children", 
+                 "mlb001b" = "activities_youth", 
+                 "mlb045" = "work", 
+                 "mlb001d" = "volunteering", 
+                 "mlb020c" = "feel_isolated", 
+                 "mlb030a" = "courtresp")
+
+colnames(df10)[colnames(df10) %in% names(sficolnames10)] <- 
+  sficolnames10[colnames(df10)[colnames(df10) %in% names(sficolnames10)]]
+
+colnames(df10oc)[colnames(df10oc) %in% names(sficolnames10)] <- 
+  sficolnames10[colnames(df10oc)[colnames(df10oc) %in% names(sficolnames10)]]
+
+#need to change labeling of sex for feature imp function#
+if ("haven_labelled" %in% class(df10$sex)) {
+  df10$sex <- as.numeric(df10$sex)
+}
+```
+
+
+# Replicate GLM for mortality - SFI10 
+
+```{r}
+#######################
+#specifying models#
+#######################
+sfi <- glm(mortality ~ age + sex + neighborhood + financial_control + freq_children 
+           + activities_youth + work + volunteering + feel_isolated + courtresp, 
+           family = binomial, data = df10, na.action = na.omit)
+
+summary(sfi)
+
+df10$SFIlp <- predict(sfi, type = "link")
+df10$SFIpr <- predict(sfi, type = "response")
+
+df10$SFIlpround <- round(df10$SFIlp, digits = 2)
+df10$SFIprround <- round(df10$SFIpr, digits = 2)
+
+#######################
+#distribution viz#
+#######################
+pdf(file.path(outdir, "2010SFIdistributions.pdf"), width = 6, height = 5)
+hist(df10$SFIlp, breaks = "sturges", freq = FALSE, 
+     xlim = c(-6, 4), ylim = c(0, 0.4), 
+     main = "2010 Cohort: SFI-10", xlab = "Mortality Risk (Log Probability)")
+lines(density(df10$SFIlp), col = "#27933E")
+hist(df10$SFIpr, breaks = "sturges", freq = FALSE, 
+     xlim = c(0, 1), ylim = c(0, 5), 
+     main = "2010 Cohort: SFI-10", xlab = "Mortality Risk (Probability)")
+lines(density(df10$SFIpr), col = "#27933E")
+dev.off()
+```
+
+
+# Age - Mortality GLM 
+
+```{r}
+#######################
+#specifying models#
+#######################
+glmage <- glm(mortality ~ age, family = binomial, data = df10, na.action = na.omit)
+summary(glmage)
+
+df10$agelp <- predict(glmage, type = "link")
+df10$agepr <- predict(glmage, type = "response")
+
+#######################
+#distribution viz#
+#######################
+pdf(file.path(outdir, "2010AGEdistributions.pdf"), width = 6, height = 5)
+hist(df10$agelp, breaks = "sturges", freq = FALSE, 
+     xlim = c(-4, 2), ylim = c(0, 0.5), 
+     main = "2010 Cohort: Age", xlab = "Mortality Risk (Log Probability)")
+lines(density(df10$agelp), col = "#27933E")
+hist(df10$agepr, breaks = "sturges", freq = FALSE, 
+     xlim = c(0, 1), ylim = c(0, 6), 
+     main = "2010 Cohort: Age", xlab = "Mortality Risk (Probability)")
+lines(density(df10$agepr), col = "#27933E")
+dev.off()
+```
+
+
+# Age & Sex - Mortality GLM 
+
+```{r}
+#######################
+#specifying models#
+#######################
+sexage <- glm(mortality ~ age + sex, family = binomial, data = df10, na.action = na.omit)
+summary(sexage)
+
+df10$sexagelp <- predict(sexage, type = "link")
+df10$sexagepr <- predict(sexage, type = "response")
+
+#######################
+#distribution viz#
+#######################
+pdf(file.path(outdir, "2010agesexdistributions.pdf"), width = 6, height = 5)
+hist(df10$sexagelp, breaks = "sturges", freq = FALSE, 
+     xlim = c(-4, 2), ylim = c(0, 0.6), 
+     main = "2010 Cohort: Age & Sex", xlab = "Mortality Risk (Log Probability)")
+lines(density(df10$sexagelp), col = "#27933E")
+hist(df10$sexagepr, breaks = "sturges", freq = FALSE, 
+     xlim = c(0, 1), ylim = c(0, 5), 
+     main = "2010 Cohort: Age & Sex", xlab = "Mortality Risk (Probability)")
+lines(density(df10$sexagepr), col = "#27933E")
+dev.off()
+```
+
+
+# Social items (SFI8) - Mortality GLM 
+
+```{r}
+#######################
+#specifying models#
+#######################
+sfisoc <- glm(mortality ~ neighborhood + financial_control + freq_children 
+           + activities_youth + work + volunteering + feel_isolated + courtresp, 
+           family = binomial, data = df10, na.action = na.omit)
+
+summary(sfisoc)
+
+df10$socSFIlp <- predict(sfisoc, type = "link")
+df10$socSFIpr <- predict(sfisoc, type = "response")
+
+#######################
+#distribution viz#
+#######################
+pdf(file.path(outdir, "2010SFI8distributions.pdf"), width = 6, height = 5)
+hist(df10$socSFIlp, breaks = "sturges", freq = FALSE, 
+     xlim = c(-4, 2), ylim = c(0, 0.6), 
+     main = "2010 Cohort: SFI-8", xlab = "Mortality Risk (Log Probability)")
+lines(density(df10$socSFIlp), col = "#27933E")
+hist(df10$socSFIpr, breaks = "sturges", freq = FALSE, 
+     xlim = c(0, 1), 
+     main = "2010 Cohort: SFI-8", xlab = "Mortality Risk (Probability)")
+lines(density(df10$socSFIpr), col = "#27933E")
+dev.off()
+```
+
+
+# Model evaluation - 2010 
+
+### AIC/BIC 
+
+```{r}
+#all models specified#
+hrsglmsBIC <- BIC(glmage, sexage, sfisoc, sfi)
+hrsglmsAIC <- AIC(glmage, sexage, sfisoc, sfi)
+
+hrsglmmodelfit <- cbind(hrsglmsBIC, hrsglmsAIC$AIC)
+
+print(hrsglmmodelfit)
+ 
+write.csv(hrsglmmodelfit, file.path(outdir, "2010ModelFit.csv"), row.names = TRUE)
+```
+
+
+### BCa bootstrap functions
+
+```{r}
+stratboot <- function(data, statistic, R = 9999, strata, conf.level = 0.95, ...) {
+  levels <- unique(strata)
+  n <- nrow(data)
+
+  resamples <- replicate(R, {
+    unlist(lapply(levels, function(lvl) {
+      idx <- which(strata == lvl)
+      sample(idx, length(idx), replace = TRUE)
+    }))
+  }, simplify = FALSE)
+
+  statwrap <- function(data, indices) statistic(data[indices, ], ...)
+
+  bootobj <- boot(data = data, statistic = statwrap, R = R, sim = "ordinary")
+  bootobj$t <- sapply(resamples, function(i) statwrap(data, i))
+  bootobj$t <- matrix(bootobj$t, ncol = 1)
+
+  ci <- boot.ci(bootobj, type = "bca", conf = conf.level)
+
+  list(
+    estimate = statwrap(data, 1:n),
+    bca_ci = ci$bca[4:5],
+    bootobj = bootobj
+  )
+}
+
+auroc <- function(data) {
+  pROC::auc(pROC::roc(data$response, data$predicted, quiet = TRUE)) |> as.numeric()
+}
+
+auprc <- function(data) {
+  PRROC::pr.curve(
+    scores.class0 = data$predicted[data$response == 1],
+    scores.class1 = data$predicted[data$response == 0],
+    curve = FALSE)$auc.integral
+}
+
+aurocdiff <- function(data) {
+  auc1 <- pROC::auc(pROC::roc(data$response, data$pred1, quiet = TRUE)) |> as.numeric()
+  auc2 <- pROC::auc(pROC::roc(data$response, data$pred2, quiet = TRUE)) |> as.numeric()
+  auc1 - auc2
+}
+
+auprcdiff <- function(data) {
+  pr1 <- PRROC::pr.curve(scores.class0 = data$pred1[data$response == 1],
+                         scores.class1 = data$pred1[data$response == 0],
+                         curve = FALSE)$auc.integral
+  pr2 <- PRROC::pr.curve(scores.class0 = data$pred2[data$response == 1],
+                         scores.class1 = data$pred2[data$response == 0],
+                         curve = FALSE)$auc.integral
+  pr1 - pr2
+}
+```
+
+
+### 2010 AUCs
+
+```{r}
+#######################
+#SFI-10#
+#######################
+set.seed(555)
+roccurvesfi10 <- roc(df10$mortality, df10$SFIpr, auc = TRUE, 
+                     ci = TRUE, of = "auc", ci.method = "bootstrap", 
+                     conf.level = 0.95, boot.n = 9999, boot.stratified = TRUE)
+aucsfi10 <- roccurvesfi10$auc
+ciaucsfi10 <-  roccurvesfi10$ci
+print(aucsfi10)
+print(ciaucsfi10)
+
+dfbcarocsfi10 <- data.frame(response = df10$mortality, 
+                            predicted = df10$SFIpr)
+bcaciaucsfi10 <- stratboot(dfbcarocsfi10, auroc, R = 9999, strata = dfbcarocsfi10$response)
+print(bcaciaucsfi10)
+
+dfrocsfi10 <- data.frame(specificity = 1 - roccurvesfi10$specificities, 
+                         sensitivity = roccurvesfi10$sensitivities)
+
+pdf(file.path(outdir, "2010SFI10AUCROC.pdf"), width = 5, height = 5)
+ggplot(dfrocsfi10, aes(x = specificity, y = sensitivity)) + 
+  geom_line(color = "#27933E", size = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = 5, color = "#5F6062") +
+    labs(title = paste0("2010 SFI-10: Mortality (AUC = ", round(aucsfi10, 3), ")"), 
+         x = "1 - Specificity", y = "Sensitivity") + 
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+dev.off()
+
+
+prcurvesfi10 <- pr.curve(scores.class0 = df10$SFIpr, weights.class0 = df10$mortality, curve = TRUE)
+auprcsfi10 <- prcurvesfi10$auc.integral
+print(auprcsfi10)
+
+dfbcaprcsfi10 <- data.frame(response = df10$mortality, 
+                            predicted = df10$SFIpr)
+bcaciauprcsfi10 <- stratboot(dfbcarocsfi10, auprc, R = 9999, strata = dfbcaprcsfi10$response)
+print(bcaciauprcsfi10)
+
+dfprcsfi10 <- data.frame(recall = prcurvesfi10$curve[, 1], 
+                         precision = prcurvesfi10$curve[, 2])
+
+pdf(file.path(outdir, "2010SFI10AUCPRC.pdf"), width = 5, height = 5)
+bline10 <- (sum(df10$mortality == TRUE)) / length(df10$mortality)
+bline10
+  
+ggplot(dfprcsfi10, aes(x = recall, y = precision)) +
+  geom_line(color = "#27933E", size = 1) +
+   geom_abline(intercept = bline10, slope = 0, linetype = 5, color = "#5F6062") +
+  labs(title = paste0("2010 SFI-10: Mortality (AUC = ", sprintf("%.3f", auprcsfi10), ")"),
+    x = "Sensitivity", y = "PPV") +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+plot(prcurvesfi10)
+dev.off()
+```
+
+
+# 2012 
+
+# Completion of Form LB in 2012 & 65+ 
+
+```{r}
+#2012 completion#
+c12 <- lrand[lrand$r11lbcomp == 1, ]
+c12$lb_year <- 2012
+c12 <- c12[!is.na(c12$r11lbcomp), ]
+
+#N = 7412 (Can't find at https://github.com/sachinjshah/Social-Frailty-Index)#
+
+#age 65+?#
+#note: Shah et al. use "mage > 65", so technically 66 +#
+#using r10agem_e for age (in months to use most restrictive unit)# 
+#at END of interview (see RAND longitudinal p. 129).#
+#Note: 66 * 12 = 792 so "> 791"#
+c12 <- c12[c12$r11agem_e > 791, ]
+
+#N = 3956 (3948 reported by Shah et al.)
+```
+
+
+# Create final df for 2012 cohort 
+
+```{r}
+#set wd#
+setwd("/example/HRSfiles/")
+
+#required for sample descriptive stats#
+lranddescvars12 <- c("r11iwstat", "hacohort", 
+                   "raracem", "rahispan", "raeduc", 
+                   "r11shlt", "r11diabe", "r11cancre","r11hearte",
+                   "r11stroke", "r11arthre", 
+                   "r11smokev", "r11smoken",
+                   "h11itot")
+
+#required for sfi#
+lrandsfivars12 <- c("hhidpn", "r11lbcomp", "lb_year", "ragender", "r11agey_e", 
+               "r11agem_e", "r11iwbeg", "r11iwendm", "r11iwendy", 
+               "radyear", "radmonth")
+
+c12 <- c12[, c(lranddescvars12, lrandsfivars12)]
+
+#convert r10iwbeg from SAS f8.0 date (days since 1/1/1960)#
+#to year and month#
+c12$r11iwbeg_r <- as.Date(c12$r11iwbeg, origin = "1960-01-01")
+
+c12$iwbeg_y <- format(c12$r11iwbeg_r, "%Y")
+c12$iwbeg_y <- as.numeric(c12$iwbeg_y)
+c12$iwbeg_m <- format(c12$r11iwbeg_r, "%m")
+c12$iwbeg_m <- as.numeric(c12$iwbeg_m)
+
+#import Rand HRS 2012 fat file#
+rand12 <- read_sav(paste0(getwd(), "/data/2012RAND/h12f3a_SPSS/h12f3a.sav"))
+names(rand12) <- tolower(names(rand12))
+
+clb12 <- merge(c12, rand12, by = "hhidpn", all.x = TRUE)
+
+df12 <- clb12[, c(lranddescvars12, lrandsfivars12, "iwbeg_y", "iwbeg_m", "nd171", 
+                  "nc095", "nc103", "nc104", "nc105",
+                  "nlb021f", "nlb026", "nlb009a", "nlb001b", 
+                  "nlb079", "nlb001d", "nlb020c", "nlb030a")]
+```
+
+
+# 4yr mortality
+
+```{r}
+#basing "4yr" mortality calculation on Shah et al.'s ACTUAL criteria (not 4yr mortality)#
+#via authors: We mentioned "4-year mortality" in the paper, but the way we defined the#
+#death_flag (the outcome, a binary indicator) was to include all deaths that occurred by#
+#the end of 2017 (Dec 31, 2017) for the 2012 cohort.#
+
+#note: dates cannot be narrowed down from months#
+#note: <= 2018 because December, 2017 would be 2017 + 1#
+#in the formula below, so 2018#
+
+df12$DOD <- df12$radyear + df12$radmonth / 12
+df12$mortality <- ifelse(is.na(df12$DOD), 0,
+                         ifelse(df12$DOD <= 2018, 1, 0))
+
+table(df12$mortality == 1)
+#906/3956 compared to 882/3948 published#
+
+#just checking when died#
+df12$interview <- df12$r11iwendy + df12$r11iwendm / 12
+df12$mortalitytime <- df12$DOD - df12$interview
+
+summary(df12$mortalitytime[df12$mortality == 1])
+hist(df12$mortalitytime[df12$mortality == 1], breaks = "sturges", freq = FALSE, 
+     main = "2012 Cohort: Mortality Time", xlab = "Time (Years)")
+lines(density(df12$mortalitytime[df12$mortality == 1]), col = "#27933E")
+
+#just checking outcome assessment window#
+df12$outcometime <- 2018 - df12$interview
+summary(df12$outcometime)
+```
+
+Total 4yr mortality suggested = 906
+Max mortality time = 5.667 years
+Shah et al. (2023) PNAS reported = 882
+
+
+# 2012 Descriptive Stats
+
+The following 2 sections can be combined to recreate the descriptive statistics in Table S1.
+
+### Descriptive stats - demographics, health status, function
+
+```{r}
+#####################
+#demographics#
+#####################
+#age (median+IQR)#
+summary(df12$r11agey_e)
+hist(df12$r11agey_e, breaks = "sturges", freq = FALSE,
+     main = "2012 Cohort: Age", xlab = "Age (Years)")
+lines(density(df12$r11agey_e), col = "#27933E")
+
+#sex (female+%)#
+table(df12$ragender == 2)
+
+
+#####################
+#health status#
+#####################
+#fair or poor self reported health (N+%)#
+table(!is.na(df12$r11shlt))
+table(df12$r11shlt  %in% c(4, 5))
+
+#diabetes (N+%)#
+table(df12$r11diabe == 1)
+
+#cancer (excluding minor skin cancer) (N+%)#
+table(df12$r11cancre == 1)
+
+#heart disease (N+%)#
+table(df12$r11hearte == 1)
+
+#stroke (N+%)#
+table(df12$r11stroke == 1)
+
+#arthritis (N+%)#
+table(df12$r11arthre == 1)
+
+#current smoker? (N+%)#
+table(df12$r11smoken == 1)
+
+#former smoker? (N+%)#
+table(df12$r11smokev == 1 & df12$r11smoken == 0)
+
+
+#####################
+#mortality#
+#####################
+#mortality#
+table(df12$mortality == 1)
+
+
+#####################
+#summarize#
+#####################
+N <- 3956
+
+# Generate table with relevant variables
+c12stats <- data.frame(
+  Variable = c(
+    "Fair or Poor Self-Reported Health",
+    "Diabetes",
+    "Cancer (excluding minor skin cancer)",
+    "Heart Disease",
+    "Stroke",
+    "Arthritis",
+    "Current Smoker",
+    "Former Smoker"
+  ),
+  `N (%)` = c(
+    freq_percent(df12$r11shlt, c(4, 5)),
+    freq_percent(df12$r11diabe, 1),  
+    freq_percent(df12$r11cancre, 1),  
+    freq_percent(df12$r11hearte, 1),  
+    freq_percent(df12$r11stroke, 1),  
+    freq_percent(df12$r11arthre, 1),  
+    freq_percent(df12$r11smoken, 1),  
+    freq_percent(df12$r11smokev[df12$r11smoken == 0], 1)
+  )
+)
+
+write.csv(c12stats, file.path(outdir, "2012 HRS health and function.csv"), row.names = TRUE)
+```
+
+
+### Descriptive stats - social characteristics 
+
+```{r}
+#####################
+#general#
+#####################
+#race (N+%)#
+table(df12$raracem)
+table(!is.na(df12$raracem))
+
+#ethnicity (N+%)#
+table(df12$rahispan)
+table(!is.na(df12$rahispan))
+
+#education (N+%)#
+table(df12$raeduc)
+table(!is.na(df12$raeduc))
+
+#missing 1; Shah et al. (2023) are too#
+
+#income (N+%)#
+summary(df12$h11itot)
+hist(df12$h11itot, breaks = "sturges", freq = FALSE, 
+     xaxt = 'n', ylim = c(0, 0.000020),
+     main = "2010 Cohort: Household Income", xlab = "Annual Income (USD)")
+axis(side = 1, at = pretty(range(df12$h11itot)), labels = pretty(range(df12$h11itot)))
+lines(density(df12$h11itot), col = "#27933E")
+
+#####################
+#sfi vars#
+#####################
+#all tables based on functional forms analysis below#
+#neighborhood unclean#
+#code (< 4) to (0); (>= 4) to (1)#
+table(df12$nlb021f >= 4)
+
+#low financial control#
+#code (< 2) to (0); (>= 2) to (1)#
+table(df12$nlb026 < 2)
+
+#meets with children less than once/year#
+#code (<= 5) to (0); (6) to (1)#
+table(df12$nlb009a == 6)
+
+#activities w/ youth#
+summary(df12$nlb001b)
+
+#work#
+table(df12$nlb079 == 1)
+
+#no volunteer#
+#code (<= 6) to (0); (7) to (1)#
+table(df12$nlb001d == 7)
+
+#loneliness#
+table(df12$nlb020c)
+
+#courtesy/respect#
+#code (<= 4) to (0); (5, 6) to (1)#
+table(df12$nlb030a <= 4)
+
+#####################
+#summarize#
+#####################
+N = 3956
+
+c12descstats <- data.frame(
+  Variable = c(
+    "Black",
+    "White",
+    "Other", 
+    "Hispanic origin", 
+    "Not of hispanic origin", 
+    "Less than high school", 
+    "High school diploma or equiv", 
+    "Some college", 
+    "College and above",
+    "< $56,599", 
+    "$56,600 - 169,799", 
+    "> $169,800", 
+    "Age", 
+    "Sex", 
+    "Neighborhood is not clean", 
+    "Low percieved financial control", 
+    "Meets with children less than once per year or equivalent", 
+    "Activities with younger folks or equivalent", 
+    "Presently working", 
+    "Does no volunteer/charity work", 
+    "Feels isolated often", 
+    "Feels isolated some of the time", 
+    "Feels isolated hardly ever or never",
+    "Often treated with less courtesy and respect than others"
+  ),
+  `N (%)` = c(
+    freq_percent(df12$raracem, 2),
+    freq_percent(df12$raracem, 1),
+    freq_percent(df12$raracem, 3),
+    freq_percent(df12$rahispan, 1), 
+    freq_percent(df12$rahispan, 0),
+    freq_percent(df12$raeduc, 1),
+    freq_percent(df12$raeduc, 2:3),
+    freq_percent(df12$raeduc, 4),
+    freq_percent(df12$raeduc, 5),
+    freq_percentlog(df12$h11itot, df12$h11itot < 56600),
+    freq_percentlog(df12$h11itot, df12$h11itot >= 56600 & df12$h11itot <= 169799),
+    freq_percentlog(df12$h11itot, df12$h11itot > 169799),
+    paste0(round(median(df12$r11agey_e), 2), 
+           " [", round(summary(df12$r11agey_e)[2], 2),",", 
+           round(summary(df12$r11agey_e)[5], 2), "]"), 
+    freq_percent(df12$ragender, 2), 
+    freq_percent(df12$nlb021f, 4:10), 
+    freq_percent(df12$nlb026, 0:1), 
+    freq_percent(df12$nlb009a, 6), 
+    paste0(round(median(df12$nlb001b), 2), 
+           " [", round(summary(df12$nlb001b)[2], 2), ",",
+           round(summary(df12$nlb001b)[5], 2), "]"),
+    freq_percent(df12$nlb079, 1), 
+    freq_percent(df12$nlb001d, 7), 
+    freq_percent(df12$nlb020c, 1), 
+    freq_percent(df12$nlb020c, 2),
+    freq_percent(df12$nlb020c, 3),
+    freq_percent(df12$nlb030a, 1:4)
+  )
+)
+
+write.csv(c12descstats, file.path(outdir, "2012 HRS descriptive stats.csv"), row.names = TRUE)
+```
+
+
+# Single imputation for missing values 
+
+### find mode & median
+
+```{r}
+#######################
+#age (r11agey_e)#
+#######################
+median(df12$r11agey_e, na.rm = TRUE)
+
+#median: 75#
+
+#######################
+#gender (ragender)#
+#######################
+findmode(df12$ragender)
+
+#mode: 2 (woman)#
+
+#######################
+#neighborhood clean (nlb021f)#
+#######################
+findmode(df12$nlb021f)
+
+#mode: 1 (highest agreement with "this area is kept very clean")#
+
+#######################
+#financial control (nlb026)#
+#######################
+findmode(df12$nlb026)
+
+#mode: 10 (very much control)#
+
+#######################
+#has children/freq. seeing (nlb009a)#
+#######################
+findmode(df12$nlb009a)
+
+#mode: 2 (once or twice a week)#
+
+#######################
+#activities w/ younger folks; grandchildren, etc. (nlb001b)#
+#######################
+findmode(df12$nlb001b)
+
+#mode: 7 (never/not relevant)#
+
+#######################
+#work (nlb079)#
+#######################
+findmode(df12$nlb079)
+
+#mode: 5 (No)#
+
+#######################
+#other volunteer/charity work (nlb001d)#
+#######################
+findmode(df12$nlb001d)
+
+#mode: 7 (never/not relevant)#
+
+#######################
+#feel isolated (nlb020c)#
+#######################
+findmode(df12$nlb020c)
+
+#mode: 3 (hardly ever or never)#
+
+#######################
+#treated w/ less courtesy/respect (nlb030a)#
+#######################
+findmode(df12$nlb030a)
+
+#mode: 6 (never)#
+```
+
+
+### Single imputation of median and mode for missing values
+
+```{r}
+#######################
+#age (r11agey_e)#
+#######################
+table(!is.na(df12$r11agey_e))
+df12$r11agey_e[is.na(df12$r11agey_e)] <- 75
+table(!is.na(df12$r11agey_e))
+
+#######################
+#sex (ragender)#
+#######################
+table(!is.na(df12$ragender))
+df12$ragender[is.na(df12$ragender)] <- 2
+table(!is.na(df12$ragender))
+
+#######################
+#neighborhood clean (nlb021f)#
+#######################
+table(!is.na(df12$nlb021f))
+df12$nlb021f[is.na(df12$nlb021f)] <- 1
+table(!is.na(df12$nlb021f))
+
+#######################
+#financial control (nlb026)#
+#######################
+table(!is.na(df12$nlb026))
+df12$nlb026[is.na(df12$nlb026)] <- 10
+table(!is.na(df12$nlb026))
+
+#######################
+#has children/freq. seeing (nlb009a)#
+#######################
+table(!is.na(df12$nlb009a))
+df12$nlb009a[is.na(df12$nlb009a)] <- 2
+table(!is.na(df12$nlb009a))
+
+#######################
+#activities w/ younger folks; grandchildren, etc. (nlb001b)#
+#######################
+table(!is.na(df12$nlb001b))
+df12$nlb001b[is.na(df12$nlb001b)] <- 7
+table(!is.na(df12$nlb001b))
+
+#######################
+#work (nlb079)#
+#######################
+table(!is.na(df12$nlb079))
+df12$nlb079[is.na(df12$nlb079)] <- 5
+table(!is.na(df12$nlb079))
+
+#######################
+#other volunteer/charity work (nlb001d)#
+#######################
+table(!is.na(df12$nlb001d))
+df12$nlb001d[is.na(df12$nlb001d)] <- 7
+table(!is.na(df12$nlb001d))
+
+#######################
+#feel isolated (nlb020c)#
+#######################
+table(!is.na(df12$nlb020c))
+df12$nlb020c[is.na(df12$nlb020c)] <- 3
+table(!is.na(df12$nlb020c))
+
+#######################
+#treated w/ less courtesy/respect (nlb030a)#
+#######################
+table(!is.na(df12$nlb030a))
+df12$nlb030a[is.na(df12$nlb030a)] <- 6
+table(!is.na(df12$nlb030a))
+```
+
+
+# Recode vars based on functional forms 
+
+```{r}
+#######################
+#create dummy df for cors later#
+#######################
+df12oc <- df12
+
+#######################
+#age (r11agey_e)#
+#no change in Shah et al. (2023)#
+#######################
+
+#######################
+#gender (ragender)#
+#######################
+#check#
+table(df12$ragender)
+
+#code male (1) to (0); female (2) to (1) per Shah et al. (2023)#
+df12$ragender[df12$ragender == 1] <- 0
+df12$ragender[df12$ragender == 2] <- 1
+
+#check#
+table(df12$ragender)
+
+#######################
+#neighborhood clean? (nlb021f)#
+#######################
+#check#
+table(df12$nlb021f)
+
+#code (< 4) to (0); (>= 4) to (1) per Shah et al. (2023)#
+df12$nlb021f <- ifelse(df12$nlb021f < 4, 0, 1)
+
+#check#
+table(df12$nlb021f)
+
+#######################
+#financial control (nlb026)#
+#######################
+#check#
+table(df12$nlb026)
+
+#code (< 2) to (0); (>= 2) to (1) per my manual categorization#
+df12$nlb026 <- ifelse(df12$nlb026 < 2, 0, 1)
+
+#check#
+table(df12$nlb026)
+
+#######################
+#has children/freq. seeing (nlb009a)#
+#######################
+#check#
+table(df12$nlb009a)
+
+#code (<= 5) to (0); (6) to (1) per Shah et al. (2023)#
+df12$nlb009a <- ifelse(df12$nlb009a < 6, 0, 1)
+
+#check#
+table(df12$nlb009a)
+
+#######################
+#activities w/ younger folks; grandchildren, etc. (nlb001b)#
+#no change#
+#######################
+#check#
+table(df12$nlb001b)
+
+#######################
+#work (nlb079)#
+#######################
+#check#
+table(df12$nlb079)
+
+#code (5) to (0), no change in (1) per Shah et al. (2023)#
+df12$nlb079[df12$nlb079 == 5] <- 0
+  
+#check#
+table(df12$nlb079)
+
+#######################
+#other volunteer/charity work (nlb001d)#
+#######################
+#check#
+table(df12$nlb001d)
+
+#code (<= 6) to (0); (7) to (1) per Shah et al. (2023)#
+df12$nlb001d <- ifelse(df12$nlb001d < 7, 0, 1)
+
+#check#
+table(df12$nlb001d)
+
+#######################
+#feel isolated (nlb020c)#
+#######################
+#check#
+table(df12$nlb020c)
+
+#code (1) to (0); (2) to (1); (3) to (2) per Shah et al. (2023)#
+df12$nlb020c <- df12$nlb020c - 1
+
+#check#
+table(df12$nlb020c)
+
+#######################
+#treated w/ less courtesy/respect (nlb030a)#
+#######################
+#check#
+table(df12$nlb030a)
+
+#code (<= 4) to (0); (5, 6) to (1) per Shah et al. (2023)# 
+df12$nlb030a <- ifelse(df12$nlb030a < 5, 0, 1)
+
+#check#
+table(df12$nlb030a)
+```
+
+
+# Change var names for modeling and viz 
+
+```{r}
+sficolnames12 <- c("r11agey_e" = "age", 
+                 "ragender" = "sex", 
+                 "nlb021f" = "neighborhood", 
+                 "nlb026" = "financial_control", 
+                 "nlb009a" = "freq_children", 
+                 "nlb001b" = "activities_youth", 
+                 "nlb079" = "work", 
+                 "nlb001d" = "volunteering", 
+                 "nlb020c" = "feel_isolated", 
+                 "nlb030a" = "courtresp")
+
+colnames(df12)[colnames(df12) %in% names(sficolnames12)] <- 
+  sficolnames12[colnames(df12)[colnames(df12) %in% names(sficolnames12)]]
+
+colnames(df12oc)[colnames(df12oc) %in% names(sficolnames12)] <- 
+  sficolnames12[colnames(df12oc)[colnames(df12oc) %in% names(sficolnames12)]]
+
+#need to change labeling of sex for feature imp funciton#
+if ("haven_labelled" %in% class(df12$sex)) {
+  df12$sex <- as.numeric(df12$sex)
+}
+```
+
+
+# Apply SFI10 coeffs from 2010
+
+```{r}
+#######################
+#specifying models#
+#######################
+df12$SFIlp <- predict(sfi, newdata = df12, type = "link")
+df12$SFIpr <- predict(sfi, newdata = df12, type = "response")
+
+df12$SFIlpround <- round(df12$SFIlp, digits = 2)
+df12$SFIprround <- round(df12$SFIpr, digits = 2)
+
+
+#######################
+#distribution viz#
+#######################
+pdf(file.path(outdir, "2012SFI10distributions.pdf"), width = 6, height = 5)
+hist(df12$SFIlp, breaks = "sturges", freq = FALSE, 
+     xlim = c(-6, 4), ylim = c(0, 0.4), 
+     main = "2012 Cohort: SFI-10", xlab = "Mortality Risk (Log Probability)")
+lines(density(df12$SFIlp), col = "#27933E")
+hist(df12$SFIpr, breaks = "sturges", freq = FALSE, 
+     xlim = c(0, 1), ylim = c(0, 6), 
+     main = "2012 Cohort: SFI-10", xlab = "Mortality Risk (Probability)")
+lines(density(df12$SFIpr), col = "#27933E")
+dev.off()
+```
+
+
+# Apply ageglm coeffs from 2010 
+
+```{r}
+#######################
+#specifying models#
+#######################
+df12$agelp <- predict(glmage, newdata = df12, type = "link")
+df12$agepr <- predict(glmage, newdata = df12, type = "response")
+
+#######################
+#distribution viz#
+#######################
+pdf(file.path(outdir, "2012AGEdistributions.pdf"), width = 6, height = 5)
+hist(df12$agelp, breaks = "sturges", freq = FALSE, 
+     xlim = c(-4, 2), ylim = c(0, 0.6), 
+     main = "2010 Cohort: Age", xlab = "Mortality Risk (Log Probability)")
+lines(density(df12$agelp), col = "#27933E")
+hist(df12$agepr, breaks = "sturges", freq = FALSE, 
+     xlim = c(0, 1), ylim = c(0, 6), 
+     main = "2010 Cohort: Age", xlab = "Mortality Risk (Probability)")
+lines(density(df12$agepr), col = "#27933E")
+dev.off()
+```
+
+
+# Apply age & sex coeffs from 2010 
+
+```{r}
+#######################
+#specifying models#
+#######################
+df12$sexagelp <- predict(sexage, newdata = df12, type = "link")
+df12$sexagepr <- predict(sexage, newdata = df12, type = "response")
+
+#######################
+#distribution viz#
+#######################
+pdf(file.path(outdir, "2012agesexdistributions.pdf"), width = 6, height = 5)
+hist(df12$sexagelp, breaks = "sturges", freq = FALSE, 
+     xlim = c(-4, 2), ylim = c(0, 0.6), 
+     main = "2012 Cohort: Age & Sex", xlab = "Mortality Risk (Log Probability)")
+lines(density(df12$sexagelp), col = "#27933E")
+hist(df12$sexagepr, breaks = "sturges", freq = FALSE, 
+     xlim = c(0, 1), ylim = c(0, 6), 
+     main = "2012 Cohort: Age & Sex", xlab = "Mortality Risk (Probability)")
+lines(density(df12$sexagepr), col = "#27933E")
+dev.off()
+```
+
+
+# Apply SFI8 coeffs from 2010
+
+```{r}
+#######################
+#specifying models#
+#######################
+df12$socSFIlp <- predict(sfisoc, newdata = df12, type = "link")
+df12$socSFIpr <- predict(sfisoc, newdata = df12, type = "response")
+
+#######################
+#distribution viz#
+#######################
+pdf(file.path(outdir, "2012SFI8distributions.pdf"), width = 6, height = 5)
+hist(df12$socSFIlp, breaks = "sturges", freq = FALSE, 
+     xlim = c(-5, 2), ylim = c(0, 0.6), 
+     main = "2012 Cohort: SFI-8", xlab = "Mortality Risk (Log Probability)")
+lines(density(df12$socSFIlp), col = "#27933E")
+hist(df12$socSFIpr, breaks = "sturges", freq = FALSE, 
+     xlim = c(0, 1), ylim = c(0, 6), 
+     main = "2012 Cohort: SFI-8", xlab = "Mortality Risk (Probability)")
+lines(density(df12$socSFIpr), col = "#27933E")
+dev.off()
+```
+
+
+# Model evaluation - 2012 
+
+### 2012 AUC ROC mortality 
+
+```{r}
+#######################
+#SFI - my replication (sfi)#
+#######################
+set.seed(555)
+roccurvesfi12 <- roc(df12$mortality, df12$SFIpr, auc = TRUE, 
+                     ci = TRUE, of = "auc", ci.method = "bootstrap", 
+                     conf.level = 0.95, boot.n = 9999, boot.stratified = TRUE)
+aucsfi12 <- roccurvesfi12$auc
+ciaucsfi12 <-  roccurvesfi12$ci
+print(aucsfi12)
+print(ciaucsfi12)
+
+dfbcarocsfi12 <- data.frame(response = df12$mortality, 
+                            predicted = df12$SFIpr)
+bcaciaucsfi12 <- stratboot(dfbcarocsfi12, auroc, R = 9999, strata = dfbcarocsfi12$response)
+print(bcaciaucsfi12)
+
+dfrocsfi12 <- data.frame(specificity = 1 - roccurvesfi12$specificities, 
+                    sensitivity = roccurvesfi12$sensitivities)
+
+pdf(file.path(outdir, "2012AUCROCs.pdf"), width = 4, height = 4)
+ggplot(dfrocsfi12, aes(x = specificity, y = sensitivity)) + 
+  geom_line(color = "#27933E", size = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = 5, color = "#5F6062") +
+    labs(title = paste0("Mortality (AUC = ", sprintf("%.3f", aucsfi12), ")"), 
+         x = "1 - Specificity", y = "Sensitivity") + 
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+
+
+#######################
+#age#
+#######################
+roccurveage12 <- roc(df12$mortality, df12$agepr, auc = TRUE, 
+                     ci = TRUE, of = "auc", ci.method = "bootstrap", 
+                     conf.level = 0.95, boot.n = 9999, boot.stratified = TRUE)
+aucage12 <- roccurveage12$auc
+ciaucage12 <-  roccurveage12$ci
+print(aucage12)
+print(ciaucage12)
+
+dfbcarocage12 <- data.frame(response = df12$mortality, 
+                            predicted = df12$agepr)
+bcaciaucage12 <- stratboot(dfbcarocage12, auroc, R = 9999, strata = dfbcarocage12$response)
+print(bcaciaucage12)
+
+dfrocage12 <- data.frame(specificity = 1 - roccurveage12$specificities, 
+                    sensitivity = roccurveage12$sensitivities)
+
+ggplot(dfrocage12, aes(x = specificity, y = sensitivity)) + 
+  geom_line(color = "#27933E", size = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = 5, color = "#5F6062") +
+    labs(title = paste0("Age: Mortality (AUC = ", sprintf("%.3f",aucage12), ")"), 
+         x = "1 - Specificity", y = "Sensitivity") + 
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+
+
+#######################
+#age & sex#
+#######################
+roccurvesexage12 <- roc(df12$mortality, df12$sexagepr, auc = TRUE, 
+                     ci = TRUE, of = "auc", ci.method = "bootstrap", 
+                     conf.level = 0.95, boot.n = 9999, boot.stratified = TRUE)
+aucsexage12 <- roccurvesexage12$auc
+ciaucsexage12 <-  roccurvesexage12$ci
+print(aucsexage12)
+print(ciaucsexage12)
+
+dfbcarocsexage12 <- data.frame(response = df12$mortality, 
+                               predicted = df12$sexagepr)
+bcaciaucsexage12 <- stratboot(dfbcarocsexage12, auroc, R = 9999, strata = dfbcarocsexage12$response)
+print(bcaciaucsexage12)
+
+dfrocsexage12 <- data.frame(specificity = 1 - roccurvesexage12$specificities, 
+                    sensitivity = roccurvesexage12$sensitivities)
+
+ggplot(dfrocsexage12, aes(x = specificity, y = sensitivity)) + 
+  geom_line(color = "#27933E", size = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = 5, color = "#5F6062") +
+    labs(title = paste0("Age & Sex: Mortality (AUC = ", sprintf("%.3f",aucsexage12), ")"), 
+         x = "1 - Specificity", y = "Sensitivity") + 
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+
+
+#######################
+#social items#
+#######################
+roccurvesfisoc12 <- roc(df12$mortality, df12$socSFIpr, auc = TRUE, 
+                     ci = TRUE, of = "auc", ci.method = "bootstrap", 
+                     conf.level = 0.95, boot.n = 9999, boot.stratified = TRUE)
+aucsfisoc12 <- roccurvesfisoc12$auc
+ciaucsfisoc12 <-  roccurvesfisoc12$ci
+print(aucsfisoc12)
+print(ciaucsfisoc12)
+
+dfbcarocsfisoc12 <- data.frame(response = df12$mortality, 
+                               predicted = df12$socSFIpr)
+bcaciaucsfisoc12 <- stratboot(dfbcarocsfisoc12, auroc, R = 9999, strata = dfbcarocsfisoc12$response)
+print(bcaciaucsfisoc12)
+
+dfrocsfisoc12 <- data.frame(specificity = 1 - roccurvesfisoc12$specificities, 
+                    sensitivity = roccurvesfisoc12$sensitivities)
+
+ggplot(dfrocsfisoc12, aes(x = specificity, y = sensitivity)) + 
+  geom_line(color = "#27933E", size = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = 5, color = "#5F6062") +
+    labs(title = paste0("SFI-8: Mortality (AUC = ", sprintf("%.3f",aucsfisoc12), ")"), 
+         x = "1 - Specificity", y = "Sensitivity") + 
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+
+
+#######################
+#combined plot#
+#######################
+dfrocsfi12$model <- paste0("SFI-10 (", sprintf("%.3f", aucsfi12), ")")
+dfrocage12$model <- paste0("Age (", sprintf("%.3f", aucage12), ")")
+dfrocsexage12$model <- paste0("Age & Sex (", sprintf("%.3f", aucsexage12), ")")
+dfrocsfisoc12$model <- paste0("SFI-8 (", sprintf("%.3f", aucsfisoc12), ")")
+
+dfrocs12 <- rbind(dfrocsfi12, dfrocage12, dfrocsexage12, dfrocsfisoc12)
+
+dfrocs12$model <- factor(dfrocs12$model, levels = c(
+  paste0("SFI-10 (", sprintf("%.3f", aucsfi12), ")"),
+  paste0("Age & Sex (", sprintf("%.3f", aucsexage12), ")"),
+  paste0("Age (", sprintf("%.3f", aucage12), ")"),
+  paste0("SFI-8 (", sprintf("%.3f", aucsfisoc12), ")")))
+
+modcols <- setNames(c("#27933E", "#B8CDF8", "#6A4C93", "#E4CC37"),
+                    c(paste0("SFI-10 (", sprintf("%.3f", aucsfi12), ")"),
+                      paste0("Age (", sprintf("%.3f", aucage12), ")"),
+                      paste0("Age & Sex (", sprintf("%.3f", aucsexage12), ")"),
+                      paste0("SFI-8 (", sprintf("%.3f", aucsfisoc12), ")")))
+
+
+ggplot(dfrocs12, aes(x = specificity, y = sensitivity, color = model)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = modcols) +
+  geom_abline(intercept = 0, slope = 1, linetype = 5, color = "#5F6062") +
+  labs(title = "Figure 1A with legend",
+       x = "1 - Specificity", y = "Sensitivity", color = expression("Model (AU"[ROC]*")")) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 11),
+    axis.text = element_text(size = 11), legend.title = element_text(size = 11),
+    legend.text = element_text(size = 11), 
+    legend.position = "right")
+
+ggplot(dfrocs12, aes(x = specificity, y = sensitivity, color = model)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = modcols) +
+  geom_abline(intercept = 0, slope = 1, linetype = 5, color = "#5F6062") +
+  labs(title = "Figure 1A",
+       x = "1 - Specificity", y = "Sensitivity", color = expression("Model (AU"[ROC]*")")) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 11),
+    axis.text = element_text(size = 11), legend.title = element_text(size = 11),
+    legend.text = element_text(size = 11), 
+    legend.position = "none")
+
+#######################
+#testing#
+#######################
+#BCa CI-based bootstrap test: SexAge vs. SFI-10#
+dfdiffsexage <- data.frame(response = df12$mortality,
+                           pred1 = df12$SFIpr,
+                           pred2 = df12$sexagepr)
+
+sfisexagediff <- stratboot(dfdiffsexage, aurocdiff, R = 9999, strata = dfdiffsexage$response, conf.level = 0.90)
+print(sfisexagediff)
+```
+
+
+### 2012 AUC PRC mortality
+
+```{r}
+#######################
+#baseline#
+#######################
+bline12 <- (sum(df12$mortality == TRUE)) / length(df12$mortality)
+bline12
+
+#######################
+#SFI#
+#######################
+set.seed(555)
+prcurvesfi12 <- pr.curve(scores.class0 = df12$SFIpr, weights.class0 = df12$mortality, curve = TRUE)
+auprcsfi12 <- prcurvesfi12$auc.integral
+print(auprcsfi12)
+
+dfbcaprcsfi12 <- data.frame(response = df12$mortality, 
+                            predicted = df12$SFIpr)
+bcaciauprcsfi12 <- stratboot(dfbcarocsfi12, auprc, R = 9999, strata = dfbcaprcsfi12$response)
+print(bcaciauprcsfi12)
+
+dfprcsfi12 <- data.frame(recall = prcurvesfi12$curve[, 1], 
+                         precision = prcurvesfi12$curve[, 2])
+
+pdf(file.path(outdir, "2012AUCPRCs.pdf"), width = 4, height = 4)
+ggplot(dfprcsfi12, aes(x = recall, y = precision)) +
+  geom_line(color = "#27933E", size = 1) +
+  geom_abline(intercept = bline12, slope = 0, linetype = 5, color = "#5F6062") +
+  labs(title = paste0("SFI-10: 4y Mortality (AUC = ", sprintf("%.3f", auprcsfi12), ")"),
+    x = "Sensitivity", y = "PPV") +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+
+plot(prcurvesfi12)
+
+#######################
+#age#
+#######################
+prcurveage12 <- pr.curve(scores.class0 = df12$agepr, weights.class0 = df12$mortality, curve = TRUE)
+auprcage12 <- prcurveage12$auc.integral
+print(auprcage12)
+
+dfbcaprcage12 <- data.frame(response = df12$mortality, 
+                            predicted = df12$agepr)
+bcaciauprcage12 <- stratboot(dfbcarocage12, auprc, R = 9999, strata = dfbcaprcage12$response)
+print(bcaciauprcage12)
+
+dfprcage12 <- data.frame(recall = prcurveage12$curve[, 1], 
+                         precision = prcurveage12$curve[, 2])
+
+ggplot(dfprcage12, aes(x = recall, y = precision)) +
+  geom_line(color = "#27933E", size = 1) +
+  geom_abline(intercept = bline12, slope = 0, linetype = 5, color = "#5F6062") +
+  labs(title = paste0("Age: 4y Mortality (AUC = ", sprintf("%.3f", auprcage12), ")"),
+    x = "Sensitivity", y = "PPV") +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+
+plot(prcurveage12)
+
+#######################
+#age & sex#
+#######################
+prcurvesexage12 <- pr.curve(scores.class0 = df12$sexagepr, weights.class0 = df12$mortality, curve = TRUE)
+auprcsexage12 <- prcurvesexage12$auc.integral
+print(auprcsexage12)
+
+dfbcaprcsexage12 <- data.frame(response = df12$mortality, 
+                               predicted = df12$sexagepr)
+bcaciauprcsexage12 <- stratboot(dfbcarocsexage12, auprc, R = 9999, strata = dfbcaprcsexage12$response)
+print(bcaciauprcsexage12)
+
+dfprcsexage12 <- data.frame(recall = prcurvesexage12$curve[, 1], 
+                         precision = prcurvesexage12$curve[, 2])
+
+ggplot(dfprcsexage12, aes(x = recall, y = precision)) +
+  geom_line(color = "#27933E", size = 1) +
+  geom_abline(intercept = bline12, slope = 0, linetype = 5, color = "#5F6062") +
+  labs(title = paste0("Age & Sex: 4y Mortality (AUC = ", sprintf("%.3f", auprcsexage12), ")"),
+    x = "Sensitivity", y = "PPV") +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+
+plot(prcurvesexage12)
+
+#######################
+#social items#
+#######################
+prcurvesocsfi12 <- pr.curve(scores.class0 = df12$socSFIpr, weights.class0 = df12$mortality, curve = TRUE)
+auprcsocsfi12 <- prcurvesocsfi12$auc.integral
+print(auprcsocsfi12)
+
+dfbcaprcsocsfi12 <- data.frame(response = df12$mortality, 
+                               predicted = df12$socSFIpr)
+bcaciauprcsocsfi12 <- stratboot(dfbcaprcsocsfi12, auprc, R = 9999, strata = dfbcaprcsocsfi12$response)
+print(bcaciauprcsocsfi12)
+
+dfprcsocsfi12 <- data.frame(recall = prcurvesocsfi12$curve[, 1], 
+                         precision = prcurvesocsfi12$curve[, 2])
+
+ggplot(dfprcsocsfi12, aes(x = recall, y = precision)) +
+  geom_line(color = "#27933E", size = 1) +
+  geom_abline(intercept = bline12, slope = 0, linetype = 5, color = "#5F6062") +
+  labs(title = paste0("SFI-8: 4y Mortality (AUC = ", sprintf("%.3f", auprcsocsfi12), ")"),
+    x = "Sensitivity", y = "PPV") +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+
+plot(prcurvesocsfi12)
+
+#######################
+#combined plot#
+#######################
+dfprcsfi12$model <- paste0("SFI-10 (", sprintf("%.3f", auprcsfi12), ")")
+dfprcage12$model <- paste0("Age (", sprintf("%.3f", auprcage12), ")")
+dfprcsexage12$model <- paste0("Age & Sex (", sprintf("%.3f", auprcsexage12), ")")
+dfprcsocsfi12$model <- paste0("SFI-8 (", sprintf("%.3f", auprcsocsfi12), ")")
+
+dfprcs12 <- rbind(dfprcsfi12, dfprcage12, dfprcsexage12, dfprcsocsfi12)
+
+dfprcs12$model <- factor(dfprcs12$model, levels = c(
+  paste0("SFI-10 (", sprintf("%.3f", auprcsfi12), ")"),
+  paste0("Age & Sex (", sprintf("%.3f", auprcsexage12), ")"),
+  paste0("Age (", sprintf("%.3f", auprcage12), ")"),
+  paste0("SFI-8 (", sprintf("%.3f", auprcsocsfi12), ")")))
+
+modcols <- setNames(c("#27933E", "#B8CDF8", "#6A4C93", "#E4CC37"),
+                    c(paste0("SFI-10 (", sprintf("%.3f", auprcsfi12), ")"),
+                      paste0("Age (", sprintf("%.3f", auprcage12), ")"),
+                      paste0("Age & Sex (", sprintf("%.3f", auprcsexage12), ")"),
+                      paste0("SFI-8 (", sprintf("%.3f", auprcsocsfi12), ")")))
+
+
+ggplot(dfprcs12, aes(x = recall, y = precision, color = model)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = modcols) +
+  geom_abline(intercept = bline12, slope = 0, linetype = 5, color = "#5F6062") +
+  labs(title = "Supplemental Figure 1A with legend",
+       x = "Sensitivity", y = "PPV", color = expression("Model (AU"[PRC]*")")) +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),
+    axis.text = element_text(size = 13), legend.title = element_text(size = 13),
+    legend.text = element_text(size = 12), 
+    legend.position = "right")
+
+ggplot(dfprcs12, aes(x = recall, y = precision, color = model)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = modcols) +
+  geom_abline(intercept = bline12, slope = 0, linetype = 5, color = "#5F6062") +
+  labs(title = "Supplemental Figure 1A",
+       x = "Sensitivity", y = "PPV", color = expression("Model (AU"[PRC]*")")) +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),
+    axis.text = element_text(size = 13), legend.title = element_text(size = 13),
+    legend.text = element_text(size = 12), 
+    legend.position = "none")
+
+dev.off()
+
+#######################
+#testing#
+#######################
+#BCa CI-based bootstrap test: SexAge vs. SFI replication#
+sfisexageprcdiff <- stratboot(dfdiffsexage, auprcdiff, R = 9999, strata = dfdiffsexage$response, conf.level = 0.90)
+print(sfisexageprcdiff)
+```
+
+
+# 2012 Feature importance
+
+
+```{r}
+sfinames <- c("age", "sex", "neighborhood", "financial_control", 
+              "freq_children", "activities_youth", "work", "volunteering", 
+              "feel_isolated", "courtresp")
+
+sfisocnames <- c("neighborhood", "financial_control", 
+                 "freq_children", "activities_youth", "work", "volunteering", 
+                 "feel_isolated", "courtresp")
+
+aurocloss <- function(response, predicted) {
+  rocobj <- roc(response, predicted)
+  return(1 - rocobj$auc)
+}
+
+auprcloss <- function(response, predicted) {
+  pc <- predicted[response == 1]
+  nc <- predicted[response == 0]
+  prcobj <- pr.curve(scores.class0 = pc, scores.class1 = nc)
+  return(1 - prcobj$auc.integral)
+}
+```
+
+
+### ROC-wise
+
+```{r}
+#######################
+#SFI-10#
+#######################
+set.seed(555)
+sfipred12 <- Predictor$new(model = sfi, data = df12[, sfinames], y = df12$mortality)
+
+sfiimp12 <- FeatureImp$new(sfipred12, loss = aurocloss, compare = "difference", n.repetitions = 1000)
+
+sfiimpplot12 <- plot(sfiimp12)
+
+df12labs <- c(age = "Age", sex = "Sex", neighborhood = "Neighborhood clean", 
+              financial_control = "Financial control", freq_children = "Meets w/ children",
+              activities_youth = "Activities w/ youth", work = "Working", volunteering = "Volunteering", 
+              feel_isolated = "Feeling isolated", courtresp = "Courtesy/respect")
+
+pdf(file.path(outdir, "2012FeatureImpsROC.pdf"), width = 5.1, height = 4)
+sfiimpplot12 +
+  ggtitle("Figure 1B") +
+  scale_x_continuous(name = expression("Feature Importance (Loss: 1 - AU"[ROC]*")"), 
+                     limits = c(-0.01, 0.18)) +
+  scale_y_discrete(name = NULL, labels = df12labs) +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13.5),      
+    axis.text = element_text(size = 13.5))
+
+sfiimp12res <- sfiimp12$results
+sfiimp12res
+write.csv(sfiimp12res, file.path(outdir, "HRS 2012 SFI10 FeatureImpROC.csv"), row.names = TRUE)
+
+#######################
+#SFI-8#
+#######################
+socpred12 <- Predictor$new(model = sfisoc, data = df12[, sfisocnames], y = df12$mortality)
+
+socimp12 <- FeatureImp$new(socpred12, loss = aurocloss, compare = "difference", n.repetitions = 1000)
+
+socimpplot12 <- plot(socimp12)
+
+socimpplot12 +
+  ggtitle("Supplemental Figure 1B") +
+  scale_x_continuous(name = expression("Feature Importance (Loss: 1 - AU"[ROC]*")")) +
+  scale_y_discrete(name = NULL, labels = df12labs) +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13.5),      
+    axis.text = element_text(size = 13.5))
+
+dev.off()
+
+socimp12res <- socimp12$results
+socimp12res
+write.csv(socimp12res, file.path(outdir, "HRS 2012 SFI8 FeatureImpROC.csv"), row.names = TRUE)
+```
+
+
+### PRC-wise ###
+
+```{r}
+#######################
+#SFI-10#
+#######################
+set.seed(555)
+sfiimpprc12 <- FeatureImp$new(sfipred12, loss = auprcloss, compare = "difference", n.repetitions = 1000)
+
+sfiimpprcplot12 <- plot(sfiimpprc12)
+
+pdf(file.path(outdir, "2012FeatureImpsPRC.pdf"), width = 5, height = 4)
+sfiimpprcplot12 +
+  ggtitle("Figure 1C") +
+  scale_x_continuous(name = expression("Feature Importance (Loss: 1 - AU"[PRC]*")"), 
+                     limits = c(-0.01, 0.22))+
+  scale_y_discrete(name = NULL, labels = df12labs) +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+
+sfiimpprc12res <- sfiimpprc12$results
+sfiimpprc12res
+write.csv(sfiimpprc12res, file.path(outdir, "HRS 2012 SFI10 FeatureImpPRC.csv"), row.names = TRUE)
+
+#######################
+#SFI-8#
+#######################
+socimpprc12 <- FeatureImp$new(socpred12, loss = auprcloss, compare = "difference", n.repetitions = 1000)
+
+socimpprcplot12 <- plot(socimpprc12)
+
+socimpprcplot12 +
+  ggtitle("Supplemental Figure 1C") +
+  scale_x_continuous(name = expression("Feature Importance (Loss: 1 - AU"[PRC]*")"), 
+                     limits = c(-0.01, 0.045), 
+                     breaks = c(0.00, 0.01, 0.02, 0.03, 0.04)) +
+  scale_y_discrete(name = NULL, labels = df12labs,) +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 14), axis.title = element_text(size = 13),      
+    axis.text = element_text(size = 13))
+
+dev.off()
+
+socimpprc12res <- socimpprc12$results
+socimpprc12res
+write.csv(socimpprc12res, file.path(outdir, "HRS 2012 SFI8 FeatureImpPRC.csv"), row.names = TRUE)
+```
+
+
+# Item correlations with age: 2012 cohort#
+
+```{r}
+#######################
+#correlations of social items with age as coded by HRS#
+#######################
+#need to recode variables first so that higher value#
+#direction associated with mortality in SFI#
+#######################
+#age#
+#no change#
+
+#neighborhood clean?#
+#no change#
+table(df12oc$neighborhood)
+
+#financial control#
+#REVERSE 0-10#
+table(df12oc$financial_control)
+df12oc$financial_control <- 10 - df12oc$financial_control
+table(df12oc$financial_control)
+
+#has children/freq. seeing#
+#no change#
+table(df12oc$freq_children)
+
+#activities w/ youth#
+#no change#
+table(df12oc$activities_youth)
+
+#work#
+#code (5) to (0), then REVERSE#
+df12oc$work[df12oc$work == 5] <- 0
+table(df12oc$work)
+df12oc$work <- 1 - df12oc$work
+table(df12oc$work)
+
+#volunteer#
+#no change#
+table(df12oc$volunteering)
+
+#feel isolated#
+#REVERSE 0-2#
+table(df12oc$feel_isolated)
+df12oc$feel_isolated <- 2 - df12oc$feel_isolated
+table(df12oc$feel_isolated)
+
+#treated courtesy/respect#
+#REVERSE 1-6#
+table(df12oc$courtresp)
+df12oc$courtresp <- 6 - df12oc$courtresp
+table(df12oc$courtresp)
+
+#######################
+#correlations of social#
+#items with age raw HRS#
+#######################
+ogcordfspear12 <- df12oc[c("age", "neighborhood", "financial_control", 
+                    "freq_children", "activities_youth", "volunteering", 
+                    "feel_isolated", "courtresp")]
+view(ogcordfspear12)
+ogcordfpear12 <- df12oc[c("age", "work")]
+view(ogcordfpear12)
+
+ogcordatpear12 <- cor(ogcordfpear12, method = "pearson")
+ogcordatspear12 <- cor(ogcordfspear12, method = "spearman")
+subsetogpear12 <- ogcordatpear12["age", ,drop = FALSE]
+subsetogspear12 <- ogcordatspear12["age", ,drop = FALSE]
+
+ogcord12 <- cbind(subsetogpear12, subsetogspear12)
+ogcordat12 <- as.data.frame(ogcord12)
+ogcordat12 <- ogcordat12[, c("age", "age", "freq_children", "activities_youth", "volunteering", 
+                          "feel_isolated", "neighborhood", "financial_control", "courtresp", 
+                          "work")]
+ogcordat12 <- ogcordat12[, c(-2)]
+ogcordat12 <- as.matrix(ogcordat12)
+colnames(ogcordat12) <- df12labs[colnames(ogcordat12)]
+rownames(ogcordat12) <- df12labs[rownames(ogcordat12)]
+
+
+#visualize#
+png(file.path(outdir, "2012agesocialitemscors.png"), width = 9, height = 9, units = "in", res = 600)
+socogplot <- corrplot(t(ogcordat12), method = "color", addCoef.col = "#000000", 
+                     col = colorRampPalette(c("#6A4C93", "white", "#27933E"))(200),  
+                     col.lim = c(-1, 1), tl.cex = 1.4, tl.col = "grey30", 
+                     cl.pos = 'n' , number.cex = 1)
+dev.off()
+
+#######################
+#following up on positive correlations#
+#######################
+#activities w/ youth#
+cor.test(df12oc$age, df12oc$activities_youth, alternative = "greater", 
+         method = "spearman", exact = FALSE, conf.level = 0.95)
+
+#volunteering#
+cor.test(df12oc$age, df12oc$volunteering, alternative = "greater", 
+         method = "spearman", exact = FALSE, conf.level = 0.95)
+
+#work#
+cor.test(df12oc$age, df12oc$work, alternative = "greater", 
+         method = "pearson", conf.level = 0.95)
+
+#feel isolated#
+cor.test(df12oc$age, df12oc$feel_isolated, alternative = "greater", 
+         method = "spearman", exact = FALSE, conf.level = 0.95)
+```
